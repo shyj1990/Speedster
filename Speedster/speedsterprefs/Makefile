@@ -1,4 +1,5 @@
-ARCHS = arm64 arm64e
+# arm64 only, see main Makefile: CI toolchain arm64e output crashes arm64e processes
+ARCHS = arm64
 SDK_PATH = $(THEOS)/sdks/iPhoneOS13.7.sdk/
 SYSROOT = $(SDK_PATH)
 
