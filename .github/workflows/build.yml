@@ -7,41 +7,69 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
+
     steps:
-      - name: Checkout
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install build dependencies
-        run: |
-          curl -fsSL -o /tmp/ldid https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_linux_x86_64
-          chmod +x /tmp/ldid
-          sudo mv /tmp/ldid /usr/local/bin/ldid
-          curl -fsSL -o /tmp/libtinfo5.deb http://archive.ubuntu.com/ubuntu/pool/universe/n/ncurses/libtinfo5_6.2-0ubuntu2.1_amd64.deb
-          sudo dpkg -i /tmp/libtinfo5.deb
+      - name: Install Theos (roothide)
+        run: bash -c "$(curl -fsSL https://raw.githubusercontent.com/roothide/theos/master/bin/install-theos)"
 
-      - name: Setup Theos
+      - name: Install iOS 13.7 SDK
         run: |
-          sudo apt-get install -y rsync
-          git clone --recursive --depth=1 https://github.com/roothide/theos.git $HOME/theos
-          git clone --depth=1 https://github.com/theos/sdks.git $HOME/sdks
-          mv $HOME/sdks/iPhoneOS13.7.sdk $HOME/theos/sdks/
-          curl -fsSL -o /tmp/toolchain.tar.lzma https://github.com/sbingner/llvm-project/releases/latest/download/linux-ios-arm64e-clang-toolchain.tar.lzma
-          TMP=$(mktemp -d)
-          tar --lzma -xf /tmp/toolchain.tar.lzma -C $TMP
-          mkdir -p $HOME/theos/toolchain/linux/iphone
-          mv $TMP/ios-arm64e-clang-toolchain/* $HOME/theos/toolchain/linux/iphone/
-          test -f $HOME/theos/toolchain/linux/iphone/bin/clang
-          chmod +x $HOME/theos/bin/* 2>/dev/null || true
-          echo "$HOME/theos/bin" >> $GITHUB_PATH
-          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+          curl -fsSL -o /tmp/sdks.zip https://github.com/theos/sdks/archive/refs/heads/master.zip
+          unzip -q /tmp/sdks.zip -d /tmp/sdks
+          mv /tmp/sdks/sdks-master/iPhoneOS13.7.sdk $HOME/theos/sdks/
 
       - name: Build package (roothide)
-        run: make package -C Speedster THEOS_PACKAGE_SCHEME=roothide FINALPACKAGE=1
+        run: |
+          export THEOS=$HOME/theos
+          make package -C Speedster THEOS_PACKAGE_SCHEME=roothide FINALPACKAGE=1
 
-      - name: Upload .deb package
+      - name: Verify code signatures
+        run: |
+          python3 - << 'EOF'
+          import struct, sys, glob
+
+          def check(path):
+              blob = open(path, 'rb').read()
+              if blob[:4] not in (b'\xcf\xfa\xed\xfe', b'\xfe\xed\xfa\xcf'):
+                  return f'{path}: not a thin mach-o, skipped'
+              ncmds, sizeofcmds = struct.unpack('<II', blob[16:24])
+              off, end = 32, 32 + sizeofcmds
+              sig = None
+              while off + 8 <= end:
+                  cmd, csize = struct.unpack('<II', blob[off:off+8])
+                  if csize < 8 or off + csize > end:
+                      return f'{path}: CORRUPT load commands'
+                  if cmd == 0x1b:
+                      sig = struct.unpack('<II', blob[off+8:off+16])
+                  off += csize
+              has_blob = b'\xcc\x0c\xde\xfa' in blob  # SuperBlob magic 0xFADE0CC0
+              if sig is None:
+                  return f'{path}: no LC_CODE_SIGNATURE (ok for ldid -S to add)'
+              if not has_blob:
+                  return f'{path}: FAIL - LC_CODE_SIGNATURE declared but no SuperBlob in file'
+              if sig[0] >= len(blob) or sig[0] + sig[1] > len(blob):
+                  return f'{path}: FAIL - signature data out of bounds {sig}'
+              return f'{path}: OK (signature blob present)'
+
+          targets = []
+          targets += glob.glob('Speedster/.theos/obj/*.dylib')
+          targets += glob.glob('Speedster/.theos/obj/*/*.bundle/*')
+          targets += glob.glob('Speedster/*/.theos/obj/*/*.bundle/*')
+          results = [check(t) for t in sorted(set(targets))]
+          for r in results:
+              print(r)
+          if any('FAIL' in r for r in results) or not any('OK' in r for r in results):
+              sys.exit('code signature verification FAILED')
+          print('all signatures verified')
+          EOF
+
+      - name: Upload package artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Speedster-rootless-deb
+          name: Speedster-roothide-deb
           path: Speedster/packages/*.deb
           if-no-files-found: error
