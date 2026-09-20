@@ -17,6 +17,7 @@ jobs:
           curl -fsSL -o /tmp/ldid https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_linux_x86_64
           chmod +x /tmp/ldid
           sudo mv /tmp/ldid /usr/local/bin/ldid
+          sudo ln -sf /usr/lib/x86_64-linux-gnu/libtinfo.so.6 /usr/lib/x86_64-linux-gnu/libtinfo.so.5
 
       - name: Setup Theos
         run: |
