@@ -1,5 +1,21 @@
 #include "sdrRootListController.h"
 #import  "spawn.h"
+#import <dlfcn.h>
+
+//Resolve the jailbreak root prefix at runtime. This dylib is always installed
+//under the jbroot (e.g. /var/jb on rootless bootstraps, a randomized path on
+//roothide), so its own load path gives us the prefix without hardcoding it.
+static NSString *jbrootPrefix(void){
+    Dl_info info;
+    if (dladdr((void *)&jbrootPrefix, &info) && info.dli_fname) {
+        NSString *selfPath = [NSString stringWithUTF8String:info.dli_fname];
+        NSRange anchor = [selfPath rangeOfString:@"/usr/lib"];
+        if (anchor.location != NSNotFound && anchor.location > 0) {
+            return [selfPath substringToIndex:anchor.location];
+        }
+    }
+    return @"/var/jb"; //rootless fallback
+}
 
 @implementation sdrRootListController
 
@@ -69,8 +85,8 @@
 
 - (void)respring:(id)sender{ //handle the "respring" button
     pid_t pid;
-    // const char *args[] = {"killall", "-9", "backboardd", NULL};
-    posix_spawn(&pid, "/var/jb/usr/bin/sbreload", NULL, NULL, NULL, NULL); 
+    NSString *sbreloadPath = [jbrootPrefix() stringByAppendingString:@"/usr/bin/sbreload"];
+    posix_spawn(&pid, sbreloadPath.fileSystemRepresentation, NULL, NULL, NULL, NULL);
 }
 
 - (void)github{

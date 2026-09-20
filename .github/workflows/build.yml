@@ -1,4 +1,4 @@
-name: Build Speedster (rootless)
+name: Build Speedster (roothide)
 
 on:
   push:
@@ -23,7 +23,7 @@ jobs:
       - name: Setup Theos
         run: |
           sudo apt-get install -y rsync
-          git clone --recursive --depth=1 https://github.com/theos/theos.git $HOME/theos
+          git clone --recursive --depth=1 https://github.com/roothide/theos.git $HOME/theos
           git clone --depth=1 https://github.com/theos/sdks.git $HOME/sdks
           mv $HOME/sdks/iPhoneOS13.7.sdk $HOME/theos/sdks/
           curl -fsSL -o /tmp/toolchain.tar.lzma https://github.com/sbingner/llvm-project/releases/latest/download/linux-ios-arm64e-clang-toolchain.tar.lzma
@@ -36,8 +36,8 @@ jobs:
           echo "$HOME/theos/bin" >> $GITHUB_PATH
           echo "THEOS=$HOME/theos" >> $GITHUB_ENV
 
-      - name: Build package (rootless)
-        run: make package -C Speedster THEOS_PACKAGE_SCHEME=rootless FINALPACKAGE=1
+      - name: Build package (roothide)
+        run: make package -C Speedster THEOS_PACKAGE_SCHEME=roothide FINALPACKAGE=1
 
       - name: Upload .deb package
         uses: actions/upload-artifact@v4
