@@ -1,4 +1,7 @@
-ARCHS = arm64 arm64e
+# arm64 only: the Linux CI toolchain emits an outdated arm64e ABI whose PAC
+# signatures crash arm64e processes (SpringBoard) at load time. arm64e
+# devices run the arm64 slice fine, so keep the package arch roothide wants.
+ARCHS = arm64
 SDK_PATH = $(THEOS)/sdks/iPhoneOS13.7.sdk/
 SYSROOT = $(SDK_PATH)
 export THEOS_DEVICE_IP = localhost
