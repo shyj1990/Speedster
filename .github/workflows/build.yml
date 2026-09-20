@@ -30,7 +30,7 @@ jobs:
       - name: Verify code signatures
         run: |
           python3 - << 'EOF'
-          import struct, sys, glob
+          import struct, sys, glob, os
 
           def check(path):
               blob = open(path, 'rb').read()
@@ -56,9 +56,9 @@ jobs:
               return f'{path}: OK (signature blob present)'
 
           targets = []
-          targets += glob.glob('Speedster/.theos/obj/*.dylib')
-          targets += glob.glob('Speedster/.theos/obj/*/*.bundle/*')
-          targets += glob.glob('Speedster/*/.theos/obj/*/*.bundle/*')
+          targets += glob.glob('Speedster/.theos/obj/**/*.dylib', recursive=True)
+          targets += glob.glob('Speedster/.theos/obj/**/*.bundle/*', recursive=True)
+          targets = [t for t in targets if os.path.isfile(t)]
           results = [check(t) for t in sorted(set(targets))]
           for r in results:
               print(r)
