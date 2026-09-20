@@ -34,7 +34,15 @@ jobs:
           python3 - << 'EOF'
           import struct, sys, glob, os
 
-          ARCH = {0x0100000C: 'arm64', 0x0100000E: 'arm64e'}
+          ARCH = {0x0100000C: 'arm64', 0x0000000C: 'arm'}
+          def arch_name(cputype, cpusub):
+              if cputype == 0x0100000C:
+                  # arm64e shares arm64's cputype; distinguished by cpusubtype
+                  # (0x80000002 = CPU_SUBTYPE_ARM64E with ABI v2 flag)
+                  if cpusub & 0x80000000 or (cpusub & 0xFF) == 2:
+                      return 'arm64e'
+                  return 'arm64'
+              return hex(cputype)
 
           def analyze_thin(name, blob):
               ncmds, sizeofcmds = struct.unpack('<II', blob[16:24])
@@ -44,8 +52,8 @@ jobs:
                   if csize < 8 or off + csize > end:
                       return f'{name}: CORRUPT load commands'
                   off += csize
-              ct = struct.unpack('<I', blob[4:8])[0]
-              return f'{name}: [{ARCH.get(ct, hex(ct))}] load commands OK'
+              ct, csub = struct.unpack('<II', blob[4:12])
+              return f'{name}: [{arch_name(ct, csub)}] load commands OK'
 
           def analyze(name, blob):
               magic = blob[:4]
@@ -54,7 +62,7 @@ jobs:
                   outs = [f'{name}: FAT ({nfat} slices)']
                   for i in range(nfat):
                       ct, csub, foff, fsize, align = struct.unpack('>IIIII', blob[8+20*i:28+20*i])
-                      outs.append(analyze_thin(f'{name} slice{i}', blob[foff:foff+fsize]))
+                      outs.append(analyze_thin(f'{name} slice{i} [{arch_name(ct, csub)}]', blob[foff:foff+fsize]))
                   return outs
               if magic in (b'\xcf\xfa\xed\xfe', b'\xfe\xed\xfa\xcf'):
                   return [analyze_thin(name, blob)]
@@ -71,7 +79,7 @@ jobs:
               print(r)
           if any('CORRUPT' in r or 'unknown' in r for r in results):
               sys.exit('mach-o verification FAILED')
-          if not any('[arm64e]' in r for r in results):
+          if not any('slice1 [arm64e]' in r for r in results):
               sys.exit('no arm64e slice produced')
           print('all mach-o outputs verified')
           EOF
