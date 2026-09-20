@@ -1,6 +1,9 @@
 #import <UIKit/UIKit.h>
 static BOOL isOnSpringBoard;
-static double SwitcherDismiss;
+// -1 means "don't touch the system value". Starting at 0.0 would make
+// emptySwitcherDismissDelay return a 0s delay before setResponse: ever runs,
+// causing the switcher animation to be recomputed constantly (high CPU on iOS 17).
+static double SwitcherDismiss = -1;
 
 // static Class CASpringAnimationClass = Nil;
 // static Class SBFAnimationSettingsClass = Nil;
@@ -79,7 +82,7 @@ void preferencesthings(){ //pref starts to look THICC
 }
 
 void inAppSpeedPreferences(){
-    NSMutableDictionary *prefs = [[NSMutableDictionary alloc] initWithContentsOfFile:@"/var/jb/var/mobile/Library/Preferences/com.hoangdus.speedsterprefs.plist"];
+    NSDictionary *prefs = [[NSUserDefaults standardUserDefaults] persistentDomainForName:@"com.hoangdus.speedsterprefs"];
 
     //in-app values
     inAppAnimationEnabled = (prefs && [prefs objectForKey:@"InAppAnimationEnabled"] ? [[prefs valueForKey:@"InAppAnimationEnabled"] boolValue] : NO );
@@ -90,6 +93,11 @@ void inAppSpeedPreferences(){
     MassValue = (prefs && [prefs objectForKey:@"DurationMassValue"] ? [[prefs valueForKey:@"DurationMassValue"] doubleValue] : 0 );
     // StiffnessValue = (prefs && [prefs objectForKey:@"StiffnessValue"] ? [[prefs valueForKey:@"StiffnessValue"] doubleValue] : 1 );
     DurationValue = (prefs && [prefs objectForKey:@"DurationMassValue"] ? [[prefs valueForKey:@"DurationMassValue"] doubleValue] : 0 );
+}
+
+static void preferencesChanged(){ //runs at load and every time the prefs darwin notification fires
+    preferencesthings();
+    inAppSpeedPreferences();
 }
 
 //reverse number to make sliders go from left to right lol
@@ -109,8 +117,14 @@ static double reverseTurnOffSpeed(double input){
 }
 
 static double reverseAppSpeedSliderValue(double input){
-    double total = 1.0;
-    return total - input;
+    double value = 1.0 - input;
+    //Floor the multiplier: values below 0.1 make CASpringAnimation parameters
+    //pathological (tiny mass/damping), which on iOS 17 + ProMotion (120Hz)
+    //keeps springs recomputing frames and burns CPU.
+    if (value < 0.1) {
+        value = 0.1;
+    }
+    return value;
 }
 
 static double reverseFolderSliderValue(double input){
@@ -170,6 +184,9 @@ static double reverseFolderSliderValue(double input){
                 }else if(reverseSpeedSliderValue(FineTuneSpeedValue) < 0.1){
                     SwitcherDismiss = 0.1;
                     //SpringboardSpeed = 2;                    
+                }else{
+                    //Slider at or below its minimum: keep the system default
+                    SwitcherDismiss = -1;
                 }
             }            
         }else{
@@ -397,7 +414,7 @@ static double reverseFolderSliderValue(double input){
         if(isNoiconflyEnable){
             return 0;
         }else{
-            return 1;
+            return %orig; //keep the system default (e.g. Respect Reduce Motion)
         } 
     }	
 %end
@@ -420,7 +437,6 @@ static double reverseFolderSliderValue(double input){
     // SBFAnimationSettingsClass = NSClassFromString(@"SBFAnimationSettings");
     isOnSpringBoard = [[[NSBundle mainBundle] bundleIdentifier] isEqual:@"com.apple.springboard"];
 
-	CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, (CFNotificationCallback)preferencesthings, CFSTR("com.hoangdus.speedsterprefs-updated"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
-	preferencesthings();
-	inAppSpeedPreferences();
+	CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, (CFNotificationCallback)preferencesChanged, CFSTR("com.hoangdus.speedsterprefs-updated"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+	preferencesChanged();
 }
