@@ -26,11 +26,11 @@ jobs:
           echo "THEOS=$HOME/theos" >> $GITHUB_ENV
 
       - name: Build package (rootless)
-        run: make package THEOS_PACKAGE_SCHEME=rootless FINALPACKAGE=1
+        run: make package -C Speedster THEOS_PACKAGE_SCHEME=rootless FINALPACKAGE=1
 
       - name: Upload .deb package
         uses: actions/upload-artifact@v4
         with:
           name: Speedster-rootless-deb
-          path: packages/*.deb
+          path: Speedster/packages/*.deb
           if-no-files-found: error
