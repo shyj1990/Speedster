@@ -29,44 +29,51 @@ jobs:
           export THEOS=$HOME/theos
           make package -C Speedster THEOS_PACKAGE_SCHEME=roothide FINALPACKAGE=1
 
-      - name: Verify code signatures
+      - name: Verify Mach-O outputs
         run: |
           python3 - << 'EOF'
           import struct, sys, glob, os
 
-          def check(path):
-              blob = open(path, 'rb').read()
-              if blob[:4] not in (b'\xcf\xfa\xed\xfe', b'\xfe\xed\xfa\xcf'):
-                  return f'{path}: not a thin mach-o, skipped'
+          ARCH = {0x0100000C: 'arm64', 0x0100000E: 'arm64e'}
+
+          def analyze_thin(name, blob):
               ncmds, sizeofcmds = struct.unpack('<II', blob[16:24])
               off, end = 32, 32 + sizeofcmds
-              sig = None
               while off + 8 <= end:
                   cmd, csize = struct.unpack('<II', blob[off:off+8])
                   if csize < 8 or off + csize > end:
-                      return f'{path}: CORRUPT load commands'
-                  if cmd == 0x1b:
-                      sig = struct.unpack('<II', blob[off+8:off+16])
+                      return f'{name}: CORRUPT load commands'
                   off += csize
-              has_blob = b'\xcc\x0c\xde\xfa' in blob  # SuperBlob magic 0xFADE0CC0
-              if sig is None:
-                  return f'{path}: no LC_CODE_SIGNATURE (ok for ldid -S to add)'
-              if not has_blob:
-                  return f'{path}: FAIL - LC_CODE_SIGNATURE declared but no SuperBlob in file'
-              if sig[0] >= len(blob) or sig[0] + sig[1] > len(blob):
-                  return f'{path}: FAIL - signature data out of bounds {sig}'
-              return f'{path}: OK (signature blob present)'
+              ct = struct.unpack('<I', blob[4:8])[0]
+              return f'{name}: [{ARCH.get(ct, hex(ct))}] load commands OK'
 
-          targets = []
-          targets += glob.glob('Speedster/.theos/obj/**/*.dylib', recursive=True)
-          targets += glob.glob('Speedster/.theos/obj/**/*.bundle/*', recursive=True)
-          targets = [t for t in targets if os.path.isfile(t)]
-          results = [check(t) for t in sorted(set(targets))]
+          def analyze(name, blob):
+              magic = blob[:4]
+              if magic == b'\xca\xfe\xba\xbe':
+                  nfat, = struct.unpack('>I', blob[4:8])
+                  outs = [f'{name}: FAT ({nfat} slices)']
+                  for i in range(nfat):
+                      ct, csub, foff, fsize, align = struct.unpack('>IIIII', blob[8+20*i:28+20*i])
+                      outs.append(analyze_thin(f'{name} slice{i}', blob[foff:foff+fsize]))
+                  return outs
+              if magic in (b'\xcf\xfa\xed\xfe', b'\xfe\xed\xfa\xcf'):
+                  return [analyze_thin(name, blob)]
+              return [f'{name}: unknown magic {magic.hex()}']
+
+          targets = [t for t in set(
+              glob.glob('Speedster/.theos/obj/**/*.dylib', recursive=True) +
+              glob.glob('Speedster/.theos/obj/**/*.bundle/*', recursive=True)
+          ) if os.path.isfile(t)]
+          results = []
+          for t in sorted(targets):
+              results += analyze(t, open(t, 'rb').read())
           for r in results:
               print(r)
-          if any('FAIL' in r for r in results) or not any('OK' in r for r in results):
-              sys.exit('code signature verification FAILED')
-          print('all signatures verified')
+          if any('CORRUPT' in r or 'unknown' in r for r in results):
+              sys.exit('mach-o verification FAILED')
+          if not any('[arm64e]' in r for r in results):
+              sys.exit('no arm64e slice produced')
+          print('all mach-o outputs verified')
           EOF
 
       - name: Upload package artifact

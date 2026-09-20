@@ -1,5 +1,5 @@
-# arm64 only, see main Makefile: CI toolchain arm64e output crashes arm64e processes
-ARCHS = arm64
+# Fat binary, see main Makefile (macOS CI emits correct arm64e ABI)
+ARCHS = arm64 arm64e
 SDK_PATH = $(THEOS)/sdks/iPhoneOS13.7.sdk/
 SYSROOT = $(SDK_PATH)
 
