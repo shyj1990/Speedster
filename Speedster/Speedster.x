@@ -173,78 +173,24 @@ static CFAbsoluteTime tweakLoadTime = 0;
 static CFAbsoluteTime springBoardDidFinishLaunchingTime = 0;
 static BOOL bootGraceArmed = NO;
 
-static void debugLog(NSString *fmt, ...); //forward decl: grace arm events are logged
-
 static BOOL bootGraceActive(void){
     if (!isOnSpringBoard || bootGraceArmed) return NO;
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     if ((now - tweakLoadTime) < 2.5) return YES; //absolute floor: burst starts ~2s after load
-    //The v2.1.4-4 diagnosis proved every freeze read happens synchronously INSIDE
-    //applicationDidFinishLaunching (PrototypeTools reads at +2-3s), so ending the grace
-    //1s after that method returns covers them deterministically. A quiescence detector
-    //was tried in v2.1.4-4 but the switcher recompute storm (~30 rewrites/s) defeats it:
-    //it never went quiet and the grace ran to the 15s ceiling every time.
+    //Device-verified (v2.1.4-4/-5 logs): every freeze read happens synchronously INSIDE
+    //applicationDidFinishLaunching (+1s..+3s, via PrototypeTools), so ending the grace
+    //1s after that method returns covers them deterministically (~3.6s total on A17).
     if (springBoardDidFinishLaunchingTime != 0) {
         if ((now - springBoardDidFinishLaunchingTime) < 1.0) return YES; //launch just completed
         bootGraceArmed = YES;
-        debugLog(@"grace ARMED (launch+1s) at +%.2fs", now - tweakLoadTime);
         return NO;
     }
     if ((now - tweakLoadTime) > 15.0) { //fallback if the launch signal never fired
         bootGraceArmed = YES;
-        debugLog(@"grace ARMED (ceiling) at +%.2fs", now - tweakLoadTime);
         return NO;
     }
     return YES;
 }
-
-//TEMP diagnosis (v2.1.4-4) ----------------------------------------------------------
-//Locate the freeze: during the boot grace only, log who READS the fluid settings values
-//(the volume HUD's auto-hide delay is computed once at launch from one of those reads).
-//Up to 3 reads per (object, selector) are logged with full call stacks; after arming the
-//getter hooks are a single branch and cost nothing.
-static void debugLog(NSString *fmt, ...){
-    va_list args;
-    va_start(args, fmt);
-    NSString *payload = [[NSString alloc] initWithFormat:fmt arguments:args];
-    va_end(args);
-    static dispatch_queue_t logQueue;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ logQueue = dispatch_queue_create("com.hoangdus.speedster.debuglog", DISPATCH_QUEUE_SERIAL); });
-    dispatch_async(logQueue, ^{
-        NSString *path = @"/var/mobile/Documents/speedster_debug.log";
-        if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
-            [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        }
-        NSString *line = [NSString stringWithFormat:@"%@ | %@\n", [NSDate date], payload];
-        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
-        if (fh) {
-            [fh seekToEndOfFile];
-            [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
-            [fh closeFile];
-        }
-    });
-}
-
-static NSMutableDictionary *diagReadCounts = nil;
-static NSLock *diagReadLock = nil;
-
-static void diagNoteRead(id object, NSString *selectorName, double value){
-    if (!diagReadLock) {
-        diagReadLock = [NSLock new];
-        diagReadCounts = [NSMutableDictionary new];
-    }
-    NSString *key = [NSString stringWithFormat:@"%p|%@", object, selectorName];
-    [diagReadLock lock];
-    NSInteger count = [diagReadCounts[key] integerValue];
-    BOOL shouldLog = (count < 3);
-    if (shouldLog) diagReadCounts[key] = @(count + 1);
-    [diagReadLock unlock];
-    if (shouldLog) {
-        debugLog(@"%@ READ ptr=%p val=%.3f stack=%@", selectorName, object, value, [[NSThread callStackSymbols] componentsJoinedByString:@" | "]);
-    }
-}
-//------------------------------------------------------------------------------------
 
 //Silence the compiler for restore calls: the hooked setters exist at runtime on the
 //recorded objects, but the compiler only knows them from the %hook context.
@@ -423,19 +369,6 @@ static void noteVolumeHUDActivity(void){
         }else{
             %orig;
         }
-    }
-
-    //TEMP diagnosis: capture who reads the values during the boot grace (see the
-    //diagnosis block above). Pure pass-through; after arming this costs one branch.
-    - (double)response {
-        double v = %orig;
-        if (isOnSpringBoard && !bootGraceArmed) diagNoteRead(self, @"response", v);
-        return v;
-    }
-    - (double)dampingRatio {
-        double v = %orig;
-        if (isOnSpringBoard && !bootGraceArmed) diagNoteRead(self, @"dampingRatio", v);
-        return v;
     }
 
 %end
@@ -722,9 +655,6 @@ static void noteVolumeHUDActivity(void){
 	preferencesChanged();
 
 	if (isOnSpringBoard) {
-		[@"" writeToFile:@"/var/mobile/Documents/speedster_debug.log" atomically:YES encoding:NSUTF8StringEncoding error:nil]; //reset diagnostic log each load
-		debugLog(@"ctor v2.1.4-4 loaded");
-
 		//Volume changes made from SpringBoard (hardware buttons etc.) are announced
 		//right before the volume HUD presents - use that as the exemption window trigger.
 		//queue:nil is REQUIRED: an async queue would run this block only after the
