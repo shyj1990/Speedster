@@ -4,7 +4,8 @@ Faster iOS animation.\
 An iOS extention(Tweak) that increases iOS animation speed.\
 Support iOS and iPadOS from 13 to 16 (newer might still be supported)
 
-
+> **Note / 说明**：This fork is tested on **iPhone 15 Pro with iOS 17.0 (relaxin, roothide-based jailbreak)**. For testing purposes only.\
+> 本分支基于 **iPhone 15 Pro / iOS 17.0（relaxin 越狱，roothide 系）** 测试，仅供测试使用。
 
 Function
 ========
