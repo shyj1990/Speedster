@@ -174,6 +174,8 @@ static CFAbsoluteTime springBoardDidFinishLaunchingTime = 0;
 static CFAbsoluteTime lastSettingsTouchTime = 0;
 static BOOL bootGraceArmed = NO;
 
+static void debugLog(NSString *fmt, ...); //forward decl: grace arm events are logged
+
 static BOOL bootGraceActive(void){
     if (!isOnSpringBoard || bootGraceArmed) return NO;
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
