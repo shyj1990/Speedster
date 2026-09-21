@@ -466,11 +466,29 @@ static void noteVolumeHUDActivity(void){
 
 %end
 
-//Direct HUD presentation as an extra trigger signal (class renamed to
-//SBVolumeControl on iOS 13+, so init the group with that class)
+//Direct HUD presentation as extra trigger signals (class renamed to
+//SBVolumeControl on iOS 13+, so init the group with that class).
+//Several redundant triggers because selector availability differs between iOS
+//versions - Logos silently skips hooks whose selector doesn't exist.
 %group VolumeHUDExempt
 %hook VolumeControl
-    - (void)_presentVolumeHUDWithVolume:(float)volume { //HUD is about to be presented
+    - (void)handleVolumeButtonWithType:(long long)arg1 down:(BOOL)arg2 { //hardware volume button press
+        noteVolumeHUDActivity();
+        %orig;
+    }
+    - (void)increaseVolume { //official SBVolumeControl API (iOS 13+)
+        noteVolumeHUDActivity();
+        %orig;
+    }
+    - (void)decreaseVolume { //official SBVolumeControl API (iOS 13+)
+        noteVolumeHUDActivity();
+        %orig;
+    }
+    - (void)_presentVolumeHUDWithVolume:(float)volume { //HUD is about to be presented (iOS 13-15)
+        noteVolumeHUDActivity();
+        %orig;
+    }
+    - (void)hideVolumeHUDIfVisible { //official SBVolumeControl API (iOS 13+)
         noteVolumeHUDActivity();
         %orig;
     }
@@ -490,8 +508,13 @@ static void noteVolumeHUDActivity(void){
 
 	if (isOnSpringBoard) {
 		//Volume changes made from SpringBoard (hardware buttons etc.) are announced
-		//right before the volume HUD presents - use that as the exemption window trigger
-		[[NSNotificationCenter defaultCenter] addObserverForName:@"AVSystemController_SystemVolumeDidChangeNotification" object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note){
+		//right before the volume HUD presents - use that as the exemption window trigger.
+		//queue:nil is REQUIRED: an async queue would run this block only after the
+		//synchronous dispatch finishes, i.e. AFTER the HUD already configured its
+		//dismiss animation with the tweaked response value. Observers registered in
+		//%ctor run first (we register before SBVolumeControl does), so a synchronous
+		//block opens the window before the HUD configures its animations.
+		[[NSNotificationCenter defaultCenter] addObserverForName:@"AVSystemController_SystemVolumeDidChangeNotification" object:nil queue:nil usingBlock:^(NSNotification *note){
 			noteVolumeHUDActivity();
 		}];
 		%init(VolumeHUDExempt, VolumeControl = objc_getClass("SBVolumeControl"));
