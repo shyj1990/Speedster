@@ -166,12 +166,11 @@ static BOOL restoringForHUD = NO;
 //then-current response and never re-read) must see STOCK values at init, or they cache
 //a poisoned copy that no amount of restoring can reach. No rewriting while the grace is
 //active; the only cost is that app animations right after a respring run at stock speed.
-//The grace ends ADAPTIVELY: once the boot configuration burst has gone quiet for 1.5s
-//(and launch completed >=1s ago), the freeze must already have happened and we arm.
-//Floors: 2.5s absolute (the burst starts ~2s after load), 15s hard ceiling as a fallback.
+//The grace ends 1s after applicationDidFinishLaunching returns: the v2.1.4-4 diagnosis
+//proved all freeze reads happen synchronously inside that method. Floors: 2.5s absolute
+//(the burst starts ~2s after load), 15s ceiling fallback if the launch signal never fires.
 static CFAbsoluteTime tweakLoadTime = 0;
 static CFAbsoluteTime springBoardDidFinishLaunchingTime = 0;
-static CFAbsoluteTime lastSettingsTouchTime = 0;
 static BOOL bootGraceArmed = NO;
 
 static void debugLog(NSString *fmt, ...); //forward decl: grace arm events are logged
@@ -179,17 +178,24 @@ static void debugLog(NSString *fmt, ...); //forward decl: grace arm events are l
 static BOOL bootGraceActive(void){
     if (!isOnSpringBoard || bootGraceArmed) return NO;
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if ((now - tweakLoadTime) < 2.5) return YES; //absolute floor
-    if ((now - tweakLoadTime) > 15.0) {
-        bootGraceArmed = YES; //hard ceiling fallback
+    if ((now - tweakLoadTime) < 2.5) return YES; //absolute floor: burst starts ~2s after load
+    //The v2.1.4-4 diagnosis proved every freeze read happens synchronously INSIDE
+    //applicationDidFinishLaunching (PrototypeTools reads at +2-3s), so ending the grace
+    //1s after that method returns covers them deterministically. A quiescence detector
+    //was tried in v2.1.4-4 but the switcher recompute storm (~30 rewrites/s) defeats it:
+    //it never went quiet and the grace ran to the 15s ceiling every time.
+    if (springBoardDidFinishLaunchingTime != 0) {
+        if ((now - springBoardDidFinishLaunchingTime) < 1.0) return YES; //launch just completed
+        bootGraceArmed = YES;
+        debugLog(@"grace ARMED (launch+1s) at +%.2fs", now - tweakLoadTime);
+        return NO;
+    }
+    if ((now - tweakLoadTime) > 15.0) { //fallback if the launch signal never fired
+        bootGraceArmed = YES;
         debugLog(@"grace ARMED (ceiling) at +%.2fs", now - tweakLoadTime);
         return NO;
     }
-    if (springBoardDidFinishLaunchingTime != 0 && (now - springBoardDidFinishLaunchingTime) < 1.0) return YES;
-    if ((now - lastSettingsTouchTime) < 1.5) return YES; //boot burst still busy
-    bootGraceArmed = YES; //quiet long enough: the freeze is done, arm permanently for this launch
-    debugLog(@"grace ARMED (quiet) at +%.2fs launchSignal=%d lastTouch=+%.2fs", now - tweakLoadTime, springBoardDidFinishLaunchingTime != 0, lastSettingsTouchTime - tweakLoadTime);
-    return NO;
+    return YES;
 }
 
 //TEMP diagnosis (v2.1.4-4) ----------------------------------------------------------
@@ -262,7 +268,6 @@ static void initStockMaps(void){
 
 static void recordStockValue(NSMapTable *map, id object, double value){
     if (!isOnSpringBoard) return;
-    lastSettingsTouchTime = CFAbsoluteTimeGetCurrent(); //feeds the boot-grace quiescence detector
     initStockMaps();
     [stockValuesLock lock];
     [map setObject:@(value) forKey:object];
