@@ -166,17 +166,77 @@ static BOOL restoringForHUD = NO;
 //then-current response and never re-read) must see STOCK values at init, or they cache
 //a poisoned copy that no amount of restoring can reach. No rewriting while the grace is
 //active; the only cost is that app animations right after a respring run at stock speed.
-//The grace ends adaptively ~4s after SpringBoard finishes launching (boot burst observed
-//~2s after tweak load), falling back to a fixed 15s if the launch signal never fires.
+//The grace ends ADAPTIVELY: once the boot configuration burst has gone quiet for 1.5s
+//(and launch completed >=1s ago), the freeze must already have happened and we arm.
+//Floors: 2.5s absolute (the burst starts ~2s after load), 15s hard ceiling as a fallback.
 static CFAbsoluteTime tweakLoadTime = 0;
 static CFAbsoluteTime springBoardDidFinishLaunchingTime = 0;
+static CFAbsoluteTime lastSettingsTouchTime = 0;
+static BOOL bootGraceArmed = NO;
 
 static BOOL bootGraceActive(void){
-    if (!isOnSpringBoard) return NO;
+    if (!isOnSpringBoard || bootGraceArmed) return NO;
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if (springBoardDidFinishLaunchingTime == 0) return (now - tweakLoadTime) < 15.0; //fallback
-    return (now - springBoardDidFinishLaunchingTime) < 4.0 && (now - tweakLoadTime) < 30.0;
+    if ((now - tweakLoadTime) < 2.5) return YES; //absolute floor
+    if ((now - tweakLoadTime) > 15.0) {
+        bootGraceArmed = YES; //hard ceiling fallback
+        debugLog(@"grace ARMED (ceiling) at +%.2fs", now - tweakLoadTime);
+        return NO;
+    }
+    if (springBoardDidFinishLaunchingTime != 0 && (now - springBoardDidFinishLaunchingTime) < 1.0) return YES;
+    if ((now - lastSettingsTouchTime) < 1.5) return YES; //boot burst still busy
+    bootGraceArmed = YES; //quiet long enough: the freeze is done, arm permanently for this launch
+    debugLog(@"grace ARMED (quiet) at +%.2fs launchSignal=%d lastTouch=+%.2fs", now - tweakLoadTime, springBoardDidFinishLaunchingTime != 0, lastSettingsTouchTime - tweakLoadTime);
+    return NO;
 }
+
+//TEMP diagnosis (v2.1.4-4) ----------------------------------------------------------
+//Locate the freeze: during the boot grace only, log who READS the fluid settings values
+//(the volume HUD's auto-hide delay is computed once at launch from one of those reads).
+//Up to 3 reads per (object, selector) are logged with full call stacks; after arming the
+//getter hooks are a single branch and cost nothing.
+static void debugLog(NSString *fmt, ...){
+    va_list args;
+    va_start(args, fmt);
+    NSString *payload = [[NSString alloc] initWithFormat:fmt arguments:args];
+    va_end(args);
+    static dispatch_queue_t logQueue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ logQueue = dispatch_queue_create("com.hoangdus.speedster.debuglog", DISPATCH_QUEUE_SERIAL); });
+    dispatch_async(logQueue, ^{
+        NSString *path = @"/var/mobile/Documents/speedster_debug.log";
+        if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
+            [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        }
+        NSString *line = [NSString stringWithFormat:@"%@ | %@\n", [NSDate date], payload];
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+        if (fh) {
+            [fh seekToEndOfFile];
+            [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+            [fh closeFile];
+        }
+    });
+}
+
+static NSMutableDictionary *diagReadCounts = nil;
+static NSLock *diagReadLock = nil;
+
+static void diagNoteRead(id object, NSString *selectorName, double value){
+    if (!diagReadLock) {
+        diagReadLock = [NSLock new];
+        diagReadCounts = [NSMutableDictionary new];
+    }
+    NSString *key = [NSString stringWithFormat:@"%p|%@", object, selectorName];
+    [diagReadLock lock];
+    NSInteger count = [diagReadCounts[key] integerValue];
+    BOOL shouldLog = (count < 3);
+    if (shouldLog) diagReadCounts[key] = @(count + 1);
+    [diagReadLock unlock];
+    if (shouldLog) {
+        debugLog(@"%@ READ ptr=%p val=%.3f stack=%@", selectorName, object, value, [[NSThread callStackSymbols] componentsJoinedByString:@" | "]);
+    }
+}
+//------------------------------------------------------------------------------------
 
 //Silence the compiler for restore calls: the hooked setters exist at runtime on the
 //recorded objects, but the compiler only knows them from the %hook context.
@@ -200,6 +260,7 @@ static void initStockMaps(void){
 
 static void recordStockValue(NSMapTable *map, id object, double value){
     if (!isOnSpringBoard) return;
+    lastSettingsTouchTime = CFAbsoluteTimeGetCurrent(); //feeds the boot-grace quiescence detector
     initStockMaps();
     [stockValuesLock lock];
     [map setObject:@(value) forKey:object];
@@ -355,6 +416,19 @@ static void noteVolumeHUDActivity(void){
         }else{
             %orig;
         }
+    }
+
+    //TEMP diagnosis: capture who reads the values during the boot grace (see the
+    //diagnosis block above). Pure pass-through; after arming this costs one branch.
+    - (double)response {
+        double v = %orig;
+        if (isOnSpringBoard && !bootGraceArmed) diagNoteRead(self, @"response", v);
+        return v;
+    }
+    - (double)dampingRatio {
+        double v = %orig;
+        if (isOnSpringBoard && !bootGraceArmed) diagNoteRead(self, @"dampingRatio", v);
+        return v;
     }
 
 %end
@@ -641,6 +715,9 @@ static void noteVolumeHUDActivity(void){
 	preferencesChanged();
 
 	if (isOnSpringBoard) {
+		[@"" writeToFile:@"/var/mobile/Documents/speedster_debug.log" atomically:YES encoding:NSUTF8StringEncoding error:nil]; //reset diagnostic log each load
+		debugLog(@"ctor v2.1.4-4 loaded");
+
 		//Volume changes made from SpringBoard (hardware buttons etc.) are announced
 		//right before the volume HUD presents - use that as the exemption window trigger.
 		//queue:nil is REQUIRED: an async queue would run this block only after the
