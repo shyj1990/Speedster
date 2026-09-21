@@ -224,9 +224,69 @@ static BOOL stackTouchesVolumeControl(void){
 }
 //------------------------------------------------------------------------------------
 
+//Root cause found via 2.1.6 log evidence: the volume HUD reads fluid settings objects
+//whose setters are NEVER called during the volume event (vcStack=0 for every call), so
+//it animates with whatever value those objects carried from an earlier (tweaked)
+//configuration - the exemption window alone can never help. Fix: remember the original
+//(caller-requested) value of every settings object we touch, and on each volume event
+//restore those stock values into the live objects before the HUD reads them. The next
+//app animation re-configures its own objects and gets tweaked values as usual.
+static NSMapTable *stockResponseValues;      //weak key: settings object -> NSNumber (caller-requested response)
+static NSMapTable *stockDampingRatioValues;  //SBFFluidBehaviorSettings
+static NSMapTable *stockDampingValues;       //SBFAnimationSettings
+static NSMapTable *stockMassValues;
+static NSLock *stockValuesLock;
+static BOOL restoringForHUD = NO;
+
+static void initStockMaps(void){
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        stockResponseValues = [NSMapTable mapTableWithKeyOptions:NSMapTableWeakMemory | NSMapTableObjectPointerPersonality valueOptions:NSMapTableStrongMemory];
+        stockDampingRatioValues = [NSMapTable mapTableWithKeyOptions:NSMapTableWeakMemory | NSMapTableObjectPointerPersonality valueOptions:NSMapTableStrongMemory];
+        stockDampingValues = [NSMapTable mapTableWithKeyOptions:NSMapTableWeakMemory | NSMapTableObjectPointerPersonality valueOptions:NSMapTableStrongMemory];
+        stockMassValues = [NSMapTable mapTableWithKeyOptions:NSMapTableWeakMemory | NSMapTableObjectPointerPersonality valueOptions:NSMapTableStrongMemory];
+        stockValuesLock = [NSLock new];
+    });
+}
+
+static void recordStockValue(NSMapTable *map, id object, double value){
+    if (!isOnSpringBoard) return;
+    initStockMaps();
+    [stockValuesLock lock];
+    [map setObject:@(value) forKey:object];
+    [stockValuesLock unlock];
+}
+
+static void restoreStockValuesForHUD(void){
+    if (!isOnSpringBoard) return;
+    initStockMaps();
+    [stockValuesLock lock];
+    restoringForHUD = YES; //hooks pass straight through to %orig while restoring
+    for (id obj in stockResponseValues) {
+        NSNumber *v = [stockResponseValues objectForKey:obj];
+        if (v) [(id)obj setResponse:[v doubleValue]];
+    }
+    for (id obj in stockDampingRatioValues) {
+        NSNumber *v = [stockDampingRatioValues objectForKey:obj];
+        if (v) [(id)obj setDampingRatio:[v doubleValue]];
+    }
+    for (id obj in stockDampingValues) {
+        NSNumber *v = [stockDampingValues objectForKey:obj];
+        if (v) [(id)obj setDamping:[v doubleValue]];
+    }
+    for (id obj in stockMassValues) {
+        NSNumber *v = [stockMassValues objectForKey:obj];
+        if (v) [(id)obj setMass:[v doubleValue]];
+    }
+    restoringForHUD = NO;
+    [stockValuesLock unlock];
+    debugLog(@"HUD restore: stock values applied to all recorded settings objects");
+}
+
 static void noteVolumeHUDActivity(NSString *source){
     volumeHUDActive = YES;
     debugLog(@"HUD window OPEN via %@", source);
+    restoreStockValuesForHUD();
     NSInteger generation = ++volumeHUDGeneration;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (volumeHUDGeneration == generation) volumeHUDActive = NO;
@@ -236,7 +296,9 @@ static void noteVolumeHUDActivity(NSString *source){
 //App Open animation and bouncing
 %hook SBFFluidBehaviorSettings
     -(void)setResponse:(double)arg1{ //App open and close speed
+        if(restoringForHUD){ %orig; return; }
         if(isOnSpringBoard){
+            recordStockValue(stockResponseValues, self, arg1);
             if(stackTouchesVolumeControl()){ //rare; callStackSymbols is slow (caused 1s app-switch lag in 2.1.6), only pay it for volume-related calls
                 NSArray *dbgStack = [NSThread callStackSymbols];
                 debugLog(@"setResponse val=%.3f active=%d vcStack=1 stack=%@", arg1, volumeHUDActive, [dbgStack componentsJoinedByString:@" | "]);
@@ -308,7 +370,9 @@ static void noteVolumeHUDActivity(NSString *source){
         }
     }
     -(void)setDampingRatio:(double)arg1{ //App open and close bouncing (volume HUD is exempted, see note above)
+        if(restoringForHUD){ %orig; return; }
         if(isOnSpringBoard){
+            recordStockValue(stockDampingRatioValues, self, arg1);
             if(stackTouchesVolumeControl()){
                 NSArray *dbgStack = [NSThread callStackSymbols];
                 debugLog(@"setDampingRatio val=%.3f active=%d vcStack=1 stack=%@", arg1, volumeHUDActive, [dbgStack componentsJoinedByString:@" | "]);
@@ -373,7 +437,9 @@ static void noteVolumeHUDActivity(NSString *source){
     // }
 
     -(void)setDamping:(double)arg1{
+        if(restoringForHUD){ %orig; return; }
         if(isOnSpringBoard){
+            recordStockValue(stockDampingValues, self, arg1);
             if(stackTouchesVolumeControl()){
                 NSArray *dbgStack = [NSThread callStackSymbols];
                 debugLog(@"setDamping val=%.3f active=%d vcStack=1 stack=%@", arg1, volumeHUDActive, [dbgStack componentsJoinedByString:@" | "]);
@@ -398,7 +464,9 @@ static void noteVolumeHUDActivity(NSString *source){
 
     //folder mass
     -(void)setMass:(double)arg1{
+        if(restoringForHUD){ %orig; return; }
         if(isOnSpringBoard){
+            recordStockValue(stockMassValues, self, arg1);
             if(stackTouchesVolumeControl()){
                 NSArray *dbgStack = [NSThread callStackSymbols];
                 debugLog(@"setMass val=%.3f active=%d vcStack=1 stack=%@", arg1, volumeHUDActive, [dbgStack componentsJoinedByString:@" | "]);
@@ -623,7 +691,7 @@ static void noteVolumeHUDActivity(NSString *source){
 		[@"" writeToFile:@"/var/mobile/Documents/speedster_debug.log" atomically:YES encoding:NSUTF8StringEncoding error:nil]; //reset diagnostic log each load
 
 		Class vc = objc_getClass("SBVolumeControl");
-		debugLog(@"ctor v2.1.6: SBVolumeControl=%@ present=%d inc=%d dec=%d handle=%d hide=%d", vc,
+		debugLog(@"ctor v2.1.8: SBVolumeControl=%@ present=%d inc=%d dec=%d handle=%d hide=%d", vc,
 			class_getInstanceMethod(vc, @selector(_presentVolumeHUDWithVolume:)) != NULL,
 			class_getInstanceMethod(vc, @selector(increaseVolume)) != NULL,
 			class_getInstanceMethod(vc, @selector(decreaseVolume)) != NULL,

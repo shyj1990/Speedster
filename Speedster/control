@@ -1,6 +1,6 @@
 Package: com.hoangdus.speedster
 Name: Speedster
-Version: 2.1.7
+Version: 2.1.8
 Architecture: iphoneos-arm
 Description: Faster iOS animation.
 Maintainer: Hoangdus
