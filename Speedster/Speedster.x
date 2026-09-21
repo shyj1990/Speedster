@@ -162,7 +162,7 @@ static void debugLog(NSString *fmt, ...){
     dispatch_async(logQueue, ^{
         NSString *path = @"/var/mobile/Documents/speedster_debug.log";
         if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
-            [@"" writeToFile:path atomically:YES];
+            [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
         }
         NSString *line = [NSString stringWithFormat:@"%@ | %@\n", [NSDate date], payload];
         NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
@@ -604,7 +604,7 @@ static void noteVolumeHUDActivity(NSString *source){
 	preferencesChanged();
 
 	if (isOnSpringBoard) {
-		[@"" writeToFile:@"/var/mobile/Documents/speedster_debug.log" atomically:YES]; //reset diagnostic log each load
+		[@"" writeToFile:@"/var/mobile/Documents/speedster_debug.log" atomically:YES encoding:NSUTF8StringEncoding error:nil]; //reset diagnostic log each load
 
 		Class vc = objc_getClass("SBVolumeControl");
 		debugLog(@"ctor v2.1.6: SBVolumeControl=%@ present=%d inc=%d dec=%d handle=%d hide=%d", vc,
