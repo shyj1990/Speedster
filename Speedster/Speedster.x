@@ -164,10 +164,19 @@ static BOOL restoringForHUD = NO;
 //Boot grace window: SpringBoard subsystems that freeze animation timing derived from
 //fluid settings (the volume HUD's auto-hide delay is computed once at launch from the
 //then-current response and never re-read) must see STOCK values at init, or they cache
-//a poisoned copy that no amount of restoring can reach. No rewriting during the first
-//15s after tweak load; the only cost is that app animations right after a respring
-//run at stock speed for 15s.
+//a poisoned copy that no amount of restoring can reach. No rewriting while the grace is
+//active; the only cost is that app animations right after a respring run at stock speed.
+//The grace ends adaptively ~4s after SpringBoard finishes launching (boot burst observed
+//~2s after tweak load), falling back to a fixed 15s if the launch signal never fires.
 static CFAbsoluteTime tweakLoadTime = 0;
+static CFAbsoluteTime springBoardDidFinishLaunchingTime = 0;
+
+static BOOL bootGraceActive(void){
+    if (!isOnSpringBoard) return NO;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (springBoardDidFinishLaunchingTime == 0) return (now - tweakLoadTime) < 15.0; //fallback
+    return (now - springBoardDidFinishLaunchingTime) < 4.0 && (now - tweakLoadTime) < 30.0;
+}
 
 //Silence the compiler for restore calls: the hooked setters exist at runtime on the
 //recorded objects, but the compiler only knows them from the %hook context.
@@ -237,7 +246,7 @@ static void noteVolumeHUDActivity(void){
         if(restoringForHUD){ %orig; return; }
         if(isOnSpringBoard){
             recordStockValue(stockResponseValues, self, arg1);
-            if((CFAbsoluteTimeGetCurrent() - tweakLoadTime) < 15.0){ //boot grace: feed stock values to launching subsystems
+            if(bootGraceActive()){
                 %orig;
                 return;
             }
@@ -309,7 +318,7 @@ static void noteVolumeHUDActivity(void){
         if(restoringForHUD){ %orig; return; }
         if(isOnSpringBoard){
             recordStockValue(stockDampingRatioValues, self, arg1);
-            if((CFAbsoluteTimeGetCurrent() - tweakLoadTime) < 15.0){ //boot grace: feed stock values to launching subsystems
+            if(bootGraceActive()){
                 %orig;
                 return;
             }
@@ -374,7 +383,7 @@ static void noteVolumeHUDActivity(void){
         if(restoringForHUD){ %orig; return; }
         if(isOnSpringBoard){
             recordStockValue(stockDampingValues, self, arg1);
-            if((CFAbsoluteTimeGetCurrent() - tweakLoadTime) < 15.0){ //boot grace: feed stock values to launching subsystems
+            if(bootGraceActive()){
                 %orig;
                 return;
             }
@@ -399,7 +408,7 @@ static void noteVolumeHUDActivity(void){
         if(restoringForHUD){ %orig; return; }
         if(isOnSpringBoard){
             recordStockValue(stockMassValues, self, arg1);
-            if((CFAbsoluteTimeGetCurrent() - tweakLoadTime) < 15.0){ //boot grace: feed stock values to launching subsystems
+            if(bootGraceActive()){
                 %orig;
                 return;
             }
@@ -578,6 +587,16 @@ static void noteVolumeHUDActivity(void){
         }
     }
 
+%end
+
+//Marks when SpringBoard finished launching so the boot grace (see note above) can end
+//adaptively instead of running a fixed 15s after every respring. The class only exists
+//in SpringBoard; Logos skips the hook everywhere else.
+%hook SpringBoard
+    - (void)applicationDidFinishLaunching:(id)application {
+        %orig;
+        springBoardDidFinishLaunchingTime = CFAbsoluteTimeGetCurrent();
+    }
 %end
 
 //Direct HUD presentation as extra trigger signals (class renamed to
