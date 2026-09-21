@@ -238,6 +238,14 @@ static NSMapTable *stockMassValues;
 static NSLock *stockValuesLock;
 static BOOL restoringForHUD = NO;
 
+//Boot grace window: SpringBoard subsystems that freeze animation timing derived from
+//fluid settings (the volume HUD's auto-hide delay is computed once at launch from the
+//then-current response and never re-read) must see STOCK values at init, or they cache
+//a poisoned copy that no amount of restoring can reach. No rewriting during the first
+//15s after tweak load; the only cost is that app animations right after a respring
+//run at stock speed for 15s.
+static CFAbsoluteTime tweakLoadTime = 0;
+
 //Silence the compiler for restore calls: the hooked setters exist at runtime on the
 //recorded objects, but the compiler only knows them from the %hook context.
 @interface NSObject (SpeedsterFluidSettings)
@@ -308,11 +316,16 @@ static void noteVolumeHUDActivity(NSString *source){
         if(restoringForHUD){ %orig; return; }
         if(isOnSpringBoard){
             recordStockValue(stockResponseValues, self, arg1);
+            if((CFAbsoluteTimeGetCurrent() - tweakLoadTime) < 15.0){ //boot grace: feed stock values to launching subsystems
+                debugLog(@"setResponse GRACE ptr=%p val=%.3f", self, arg1);
+                %orig;
+                return;
+            }
             if(stackTouchesVolumeControl()){ //rare; callStackSymbols is slow (caused 1s app-switch lag in 2.1.6), only pay it for volume-related calls
                 NSArray *dbgStack = [NSThread callStackSymbols];
-                debugLog(@"setResponse val=%.3f active=%d vcStack=1 stack=%@", arg1, volumeHUDActive, [dbgStack componentsJoinedByString:@" | "]);
+                debugLog(@"setResponse ptr=%p val=%.3f active=%d vcStack=1 stack=%@", self, arg1, volumeHUDActive, [dbgStack componentsJoinedByString:@" | "]);
             }else{
-                debugLog(@"setResponse val=%.3f active=%d vcStack=0", arg1, volumeHUDActive);
+                debugLog(@"setResponse ptr=%p val=%.3f active=%d vcStack=0", self, arg1, volumeHUDActive);
             }
         }
         if(volumeHUDActive){ //stock volume HUD: keep untouched, don't disturb switcher state
@@ -382,11 +395,16 @@ static void noteVolumeHUDActivity(NSString *source){
         if(restoringForHUD){ %orig; return; }
         if(isOnSpringBoard){
             recordStockValue(stockDampingRatioValues, self, arg1);
+            if((CFAbsoluteTimeGetCurrent() - tweakLoadTime) < 15.0){ //boot grace: feed stock values to launching subsystems
+                debugLog(@"setDampingRatio GRACE ptr=%p val=%.3f", self, arg1);
+                %orig;
+                return;
+            }
             if(stackTouchesVolumeControl()){
                 NSArray *dbgStack = [NSThread callStackSymbols];
-                debugLog(@"setDampingRatio val=%.3f active=%d vcStack=1 stack=%@", arg1, volumeHUDActive, [dbgStack componentsJoinedByString:@" | "]);
+                debugLog(@"setDampingRatio ptr=%p val=%.3f active=%d vcStack=1 stack=%@", self, arg1, volumeHUDActive, [dbgStack componentsJoinedByString:@" | "]);
             }else{
-                debugLog(@"setDampingRatio val=%.3f active=%d vcStack=0", arg1, volumeHUDActive);
+                debugLog(@"setDampingRatio ptr=%p val=%.3f active=%d vcStack=0", self, arg1, volumeHUDActive);
             }
         }
         if(volumeHUDActive){ //stock volume HUD: keep untouched
@@ -449,11 +467,16 @@ static void noteVolumeHUDActivity(NSString *source){
         if(restoringForHUD){ %orig; return; }
         if(isOnSpringBoard){
             recordStockValue(stockDampingValues, self, arg1);
+            if((CFAbsoluteTimeGetCurrent() - tweakLoadTime) < 15.0){ //boot grace: feed stock values to launching subsystems
+                debugLog(@"setDamping GRACE ptr=%p val=%.3f", self, arg1);
+                %orig;
+                return;
+            }
             if(stackTouchesVolumeControl()){
                 NSArray *dbgStack = [NSThread callStackSymbols];
-                debugLog(@"setDamping val=%.3f active=%d vcStack=1 stack=%@", arg1, volumeHUDActive, [dbgStack componentsJoinedByString:@" | "]);
+                debugLog(@"setDamping ptr=%p val=%.3f active=%d vcStack=1 stack=%@", self, arg1, volumeHUDActive, [dbgStack componentsJoinedByString:@" | "]);
             }else{
-                debugLog(@"setDamping val=%.3f active=%d vcStack=0", arg1, volumeHUDActive);
+                debugLog(@"setDamping ptr=%p val=%.3f active=%d vcStack=0", self, arg1, volumeHUDActive);
             }
         }
         if(volumeHUDActive){ //stock volume HUD: keep untouched
@@ -476,11 +499,16 @@ static void noteVolumeHUDActivity(NSString *source){
         if(restoringForHUD){ %orig; return; }
         if(isOnSpringBoard){
             recordStockValue(stockMassValues, self, arg1);
+            if((CFAbsoluteTimeGetCurrent() - tweakLoadTime) < 15.0){ //boot grace: feed stock values to launching subsystems
+                debugLog(@"setMass GRACE ptr=%p val=%.3f", self, arg1);
+                %orig;
+                return;
+            }
             if(stackTouchesVolumeControl()){
                 NSArray *dbgStack = [NSThread callStackSymbols];
-                debugLog(@"setMass val=%.3f active=%d vcStack=1 stack=%@", arg1, volumeHUDActive, [dbgStack componentsJoinedByString:@" | "]);
+                debugLog(@"setMass ptr=%p val=%.3f active=%d vcStack=1 stack=%@", self, arg1, volumeHUDActive, [dbgStack componentsJoinedByString:@" | "]);
             }else{
-                debugLog(@"setMass val=%.3f active=%d vcStack=0", arg1, volumeHUDActive);
+                debugLog(@"setMass ptr=%p val=%.3f active=%d vcStack=0", self, arg1, volumeHUDActive);
             }
         }
         if(volumeHUDActive){ //stock volume HUD: keep untouched
@@ -689,6 +717,7 @@ static void noteVolumeHUDActivity(NSString *source){
 %end
 
 %ctor { //More pref
+    tweakLoadTime = CFAbsoluteTimeGetCurrent(); //start of the 15s boot grace window (see note above)
     // NSLog(@"[Speedster] load test");
     // CASpringAnimationClass = NSClassFromString(@"CASpringAnimation");
     // SBFAnimationSettingsClass = NSClassFromString(@"SBFAnimationSettings");
@@ -703,7 +732,7 @@ static void noteVolumeHUDActivity(NSString *source){
 		[@"" writeToFile:@"/var/mobile/Documents/speedster_debug.log" atomically:YES encoding:NSUTF8StringEncoding error:nil]; //reset diagnostic log each load
 
 		Class vc = objc_getClass("SBVolumeControl");
-		debugLog(@"ctor v2.1.4-2: SBVolumeControl=%@ present=%d inc=%d dec=%d handle=%d hide=%d", vc,
+		debugLog(@"ctor v2.1.4-3: SBVolumeControl=%@ present=%d inc=%d dec=%d handle=%d hide=%d", vc,
 			class_getInstanceMethod(vc, @selector(_presentVolumeHUDWithVolume:)) != NULL,
 			class_getInstanceMethod(vc, @selector(increaseVolume)) != NULL,
 			class_getInstanceMethod(vc, @selector(decreaseVolume)) != NULL,
