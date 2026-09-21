@@ -2,14 +2,17 @@
 #import  "spawn.h"
 #import <dlfcn.h>
 
-//Resolve the jailbreak root prefix at runtime. This dylib is always installed
-//under the jbroot (e.g. /var/jb on rootless bootstraps, a randomized path on
-//roothide), so its own load path gives us the prefix without hardcoding it.
+//Resolve the jailbreak root prefix at runtime. This dylib is installed inside
+//the preference bundle (e.g. <jbroot>/Library/PreferenceBundles/SpeedsterPrefs.bundle),
+//where <jbroot> is /var/jb on rootless bootstraps and a randomized path on
+//roothide, so its own load path gives us the prefix without hardcoding it.
 static NSString *jbrootPrefix(void){
     Dl_info info;
     if (dladdr((void *)&jbrootPrefix, &info) && info.dli_fname) {
         NSString *selfPath = [NSString stringWithUTF8String:info.dli_fname];
-        NSRange anchor = [selfPath rangeOfString:@"/usr/lib"];
+        // The preference bundle always lives under /Library/PreferenceBundles
+        // inside the jailbreak root, so use that as the path anchor.
+        NSRange anchor = [selfPath rangeOfString:@"/Library/PreferenceBundles"];
         if (anchor.location != NSNotFound && anchor.location > 0) {
             return [selfPath substringToIndex:anchor.location];
         }
@@ -40,7 +43,7 @@ static NSString *jbrootPrefix(void){
     [self removeSpecifier:self.savedSpecifiers[@"3"] animated:animated];
   // If the switch is set to YES, then add back fine tune slider
   } else if(![self containsSpecifier:self.savedSpecifiers[@"3"]]) {
-    [self insertSpecifier:self.savedSpecifiers[@"3"] atIndex:8 animated:animated];
+    [self insertSpecifier:self.savedSpecifiers[@"3"] atIndex:4 animated:animated];
   }
 
   //Check if our switch is set to YES, then remove preset
@@ -48,7 +51,7 @@ static NSString *jbrootPrefix(void){
     [self removeSpecifier:self.savedSpecifiers[@"2"] animated:animated];
   // If the switch is set to NO, add back the preset
   } else if(![self containsSpecifier:self.savedSpecifiers[@"2"]]) {
-    [self insertSpecifier:self.savedSpecifiers[@"2"] atIndex:8 animated:animated];
+    [self insertSpecifier:self.savedSpecifiers[@"2"] atIndex:4 animated:animated];
   }
 
   //Check if our switch is set to NO, then remove fine tune slider
@@ -56,7 +59,7 @@ static NSString *jbrootPrefix(void){
     [self removeSpecifier:self.savedSpecifiers[@"5"] animated:animated];
   // If the switch is set to YES, then add back fine tune slider
   } else if(![self containsSpecifier:self.savedSpecifiers[@"5"]]) {
-    [self insertSpecifier:self.savedSpecifiers[@"5"] atIndex:11 animated:animated];
+    [self insertSpecifier:self.savedSpecifiers[@"5"] atIndex:7 animated:animated];
   }
 
   //Check if our switch is set to YES, then remove preset
@@ -64,7 +67,7 @@ static NSString *jbrootPrefix(void){
     [self removeSpecifier:self.savedSpecifiers[@"4"] animated:animated];
   // If the switch is set to NO, add back the preset
   } else if(![self containsSpecifier:self.savedSpecifiers[@"4"]]) {
-    [self insertSpecifier:self.savedSpecifiers[@"4"] atIndex:11 animated:animated];
+    [self insertSpecifier:self.savedSpecifiers[@"4"] atIndex:7 animated:animated];
   }
 }
 
@@ -85,8 +88,17 @@ static NSString *jbrootPrefix(void){
 
 - (void)respring:(id)sender{ //handle the "respring" button
     pid_t pid;
-    NSString *sbreloadPath = [jbrootPrefix() stringByAppendingString:@"/usr/bin/sbreload"];
-    posix_spawn(&pid, sbreloadPath.fileSystemRepresentation, NULL, NULL, NULL, NULL);
+    NSString *jb = jbrootPrefix();
+
+    //Preferred: sbreload (resprings cleanly and waits for SpringBoard to return)
+    NSString *sbreloadPath = [jb stringByAppendingString:@"/usr/bin/sbreload"];
+    const char *sbreloadArgv[] = {sbreloadPath.fileSystemRepresentation, NULL};
+    if (posix_spawn(&pid, sbreloadArgv[0], NULL, NULL, (char *const *)sbreloadArgv, NULL) != 0) {
+        //Fallback: plain respring by killing SpringBoard (same uid, always allowed)
+        NSString *killallPath = [jb stringByAppendingString:@"/usr/bin/killall"];
+        const char *killallArgv[] = {killallPath.fileSystemRepresentation, "SpringBoard", NULL};
+        posix_spawn(&pid, killallArgv[0], NULL, NULL, (char *const *)killallArgv, NULL);
+    }
 }
 
 - (void)github{
