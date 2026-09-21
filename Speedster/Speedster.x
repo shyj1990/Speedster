@@ -1,5 +1,7 @@
 #import <UIKit/UIKit.h>
 #import <dispatch/dispatch.h>
+#import <objc/runtime.h>
+#import <execinfo.h>
 static BOOL isOnSpringBoard;
 // -1 means "don't touch the system value". Starting at 0.0 would make
 // emptySwitcherDismissDelay return a 0s delay before setResponse: ever runs,
@@ -144,8 +146,87 @@ static double reverseFolderSliderValue(double input){
 static NSInteger volumeHUDGeneration = 0;
 static BOOL volumeHUDActive = NO;
 
-static void noteVolumeHUDActivity(void){
+//TEMP diagnostic logging (v2.1.6) ---------------------------------------------------
+//Two window-timing attempts (2.1.4/2.1.5) failed; this build only collects evidence.
+//Everything relevant is appended to /var/mobile/Documents/speedster_debug.log
+//(SpringBoard runs as mobile, so that path is writable; call sites guard with
+//isOnSpringBoard so in-app processes never touch the file).
+static void debugLog(NSString *fmt, ...){
+    va_list args;
+    va_start(args, fmt);
+    NSString *payload = [[NSString alloc] initWithFormat:fmt arguments:args];
+    va_end(args);
+    static dispatch_queue_t logQueue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ logQueue = dispatch_queue_create("com.hoangdus.speedster.debuglog", DISPATCH_QUEUE_SERIAL); });
+    dispatch_async(logQueue, ^{
+        NSString *path = @"/var/mobile/Documents/speedster_debug.log";
+        if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
+            [@"" writeToFile:path atomically:YES];
+        }
+        NSString *line = [NSString stringWithFormat:@"%@ | %@\n", [NSDate date], payload];
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+        if (fh) {
+            [fh seekToEndOfFile];
+            [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+            [fh closeFile];
+        }
+    });
+}
+
+//IMP map of SBVolumeControl so a raw (symbol-stripped) stack can still be checked:
+//if any return address falls inside an SBVolumeControl method body, the current
+//setResponse:/setDampingRatio: call belongs to the volume HUD animation path.
+static uintptr_t volumeControlIMPs[512];
+static NSInteger volumeControlIMPCount = 0;
+
+static void collectVolumeControlIMPs(void){
+    if (volumeControlIMPCount > 0) return;
+    Class vc = objc_getClass("SBVolumeControl");
+    if (!vc) return;
+    unsigned int count = 0;
+    Method *methods = class_copyMethodList(vc, &count);
+    for (unsigned int i = 0; i < count && volumeControlIMPCount < 512; i++) {
+        volumeControlIMPs[volumeControlIMPCount++] = (uintptr_t)method_getImplementation(methods[i]);
+    }
+    free(methods);
+    //sort ascending so a stack address between imp[k] and imp[k+1] maps to method k
+    for (NSInteger i = 1; i < volumeControlIMPCount; i++) {
+        uintptr_t key = volumeControlIMPs[i];
+        NSInteger j = i - 1;
+        while (j >= 0 && volumeControlIMPs[j] > key) {
+            volumeControlIMPs[j + 1] = volumeControlIMPs[j];
+            j--;
+        }
+        volumeControlIMPs[j + 1] = key;
+    }
+}
+
+static BOOL stackTouchesVolumeControl(void){
+    if (volumeControlIMPCount == 0) return NO;
+    void *bt[128];
+    int n = backtrace(bt, 128);
+    for (int i = 0; i < n; i++) {
+        uintptr_t addr = (uintptr_t)bt[i];
+        //binary search: largest IMP <= addr
+        NSInteger lo = 0, hi = volumeControlIMPCount - 1, mid = -1;
+        while (lo <= hi) {
+            NSInteger m = (lo + hi) / 2;
+            if (volumeControlIMPs[m] <= addr) { mid = m; lo = m + 1; }
+            else hi = m - 1;
+        }
+        if (mid >= 0) {
+            uintptr_t upper = (mid + 1 < volumeControlIMPCount) ? volumeControlIMPs[mid + 1] : volumeControlIMPs[mid] + 16384;
+            if (addr < upper) return YES;
+        }
+    }
+    return NO;
+}
+//------------------------------------------------------------------------------------
+
+static void noteVolumeHUDActivity(NSString *source){
     volumeHUDActive = YES;
+    debugLog(@"HUD window OPEN via %@", source);
     NSInteger generation = ++volumeHUDGeneration;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (volumeHUDGeneration == generation) volumeHUDActive = NO;
@@ -155,6 +236,10 @@ static void noteVolumeHUDActivity(void){
 //App Open animation and bouncing
 %hook SBFFluidBehaviorSettings
     -(void)setResponse:(double)arg1{ //App open and close speed
+        if(isOnSpringBoard){
+            NSArray *dbgStack = [NSThread callStackSymbols];
+            debugLog(@"setResponse val=%.3f active=%d vcStack=%d stack=%@", arg1, volumeHUDActive, stackTouchesVolumeControl(), [dbgStack componentsJoinedByString:@" | "]);
+        }
         if(volumeHUDActive){ //stock volume HUD: keep untouched, don't disturb switcher state
             %orig;
             return;
@@ -219,6 +304,10 @@ static void noteVolumeHUDActivity(void){
         }
     }
     -(void)setDampingRatio:(double)arg1{ //App open and close bouncing (volume HUD is exempted, see note above)
+        if(isOnSpringBoard){
+            NSArray *dbgStack = [NSThread callStackSymbols];
+            debugLog(@"setDampingRatio val=%.3f active=%d vcStack=%d stack=%@", arg1, volumeHUDActive, stackTouchesVolumeControl(), [dbgStack componentsJoinedByString:@" | "]);
+        }
         if(volumeHUDActive){ //stock volume HUD: keep untouched
             %orig;
             return;
@@ -276,6 +365,10 @@ static void noteVolumeHUDActivity(void){
     // }
 
     -(void)setDamping:(double)arg1{
+        if(isOnSpringBoard){
+            NSArray *dbgStack = [NSThread callStackSymbols];
+            debugLog(@"setDamping val=%.3f active=%d vcStack=%d stack=%@", arg1, volumeHUDActive, stackTouchesVolumeControl(), [dbgStack componentsJoinedByString:@" | "]);
+        }
         if(volumeHUDActive){ //stock volume HUD: keep untouched
             %orig;
             return;
@@ -293,6 +386,10 @@ static void noteVolumeHUDActivity(void){
 
     //folder mass
     -(void)setMass:(double)arg1{
+        if(isOnSpringBoard){
+            NSArray *dbgStack = [NSThread callStackSymbols];
+            debugLog(@"setMass val=%.3f active=%d vcStack=%d stack=%@", arg1, volumeHUDActive, stackTouchesVolumeControl(), [dbgStack componentsJoinedByString:@" | "]);
+        }
         if(volumeHUDActive){ //stock volume HUD: keep untouched
             %orig;
             return;
@@ -473,23 +570,23 @@ static void noteVolumeHUDActivity(void){
 %group VolumeHUDExempt
 %hook VolumeControl
     - (void)handleVolumeButtonWithType:(long long)arg1 down:(BOOL)arg2 { //hardware volume button press
-        noteVolumeHUDActivity();
+        noteVolumeHUDActivity(@"handleVolumeButton");
         %orig;
     }
     - (void)increaseVolume { //official SBVolumeControl API (iOS 13+)
-        noteVolumeHUDActivity();
+        noteVolumeHUDActivity(@"increaseVolume");
         %orig;
     }
     - (void)decreaseVolume { //official SBVolumeControl API (iOS 13+)
-        noteVolumeHUDActivity();
+        noteVolumeHUDActivity(@"decreaseVolume");
         %orig;
     }
     - (void)_presentVolumeHUDWithVolume:(float)volume { //HUD is about to be presented (iOS 13-15)
-        noteVolumeHUDActivity();
+        noteVolumeHUDActivity(@"_presentVolumeHUD");
         %orig;
     }
     - (void)hideVolumeHUDIfVisible { //official SBVolumeControl API (iOS 13+)
-        noteVolumeHUDActivity();
+        noteVolumeHUDActivity(@"hideVolumeHUD");
         %orig;
     }
 %end
@@ -507,6 +604,30 @@ static void noteVolumeHUDActivity(void){
 	preferencesChanged();
 
 	if (isOnSpringBoard) {
+		[@"" writeToFile:@"/var/mobile/Documents/speedster_debug.log" atomically:YES]; //reset diagnostic log each load
+
+		Class vc = objc_getClass("SBVolumeControl");
+		debugLog(@"ctor v2.1.6: SBVolumeControl=%@ present=%d inc=%d dec=%d handle=%d hide=%d", vc,
+			class_getInstanceMethod(vc, @selector(_presentVolumeHUDWithVolume:)) != NULL,
+			class_getInstanceMethod(vc, @selector(increaseVolume)) != NULL,
+			class_getInstanceMethod(vc, @selector(decreaseVolume)) != NULL,
+			class_getInstanceMethod(vc, @selector(handleVolumeButtonWithType:down:)) != NULL,
+			class_getInstanceMethod(vc, @selector(hideVolumeHUDIfVisible)) != NULL);
+
+		collectVolumeControlIMPs(); //must run BEFORE %init so we capture the ORIGINAL imps
+
+		//Re-check 10s later: %ctor runs during dyld init, the class may register afterwards
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+			Class vcl = objc_getClass("SBVolumeControl");
+			debugLog(@"late check: SBVolumeControl=%@ present=%d inc=%d dec=%d handle=%d hide=%d", vcl,
+				class_getInstanceMethod(vcl, @selector(_presentVolumeHUDWithVolume:)) != NULL,
+				class_getInstanceMethod(vcl, @selector(increaseVolume)) != NULL,
+				class_getInstanceMethod(vcl, @selector(decreaseVolume)) != NULL,
+				class_getInstanceMethod(vcl, @selector(handleVolumeButtonWithType:down:)) != NULL,
+				class_getInstanceMethod(vcl, @selector(hideVolumeHUDIfVisible)) != NULL);
+			collectVolumeControlIMPs(); //no-op if already collected at ctor time
+		});
+
 		//Volume changes made from SpringBoard (hardware buttons etc.) are announced
 		//right before the volume HUD presents - use that as the exemption window trigger.
 		//queue:nil is REQUIRED: an async queue would run this block only after the
@@ -515,8 +636,12 @@ static void noteVolumeHUDActivity(void){
 		//%ctor run first (we register before SBVolumeControl does), so a synchronous
 		//block opens the window before the HUD configures its animations.
 		[[NSNotificationCenter defaultCenter] addObserverForName:@"AVSystemController_SystemVolumeDidChangeNotification" object:nil queue:nil usingBlock:^(NSNotification *note){
-			noteVolumeHUDActivity();
+			debugLog(@"volume notification arrived");
+			noteVolumeHUDActivity(@"notification");
 		}];
+		debugLog(@"ctor: notification observer registered");
+
 		%init(VolumeHUDExempt, VolumeControl = objc_getClass("SBVolumeControl"));
+		debugLog(@"ctor: VolumeHUDExempt initialized");
 	}
 }
