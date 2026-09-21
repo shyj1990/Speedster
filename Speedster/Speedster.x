@@ -1,4 +1,5 @@
 #import <UIKit/UIKit.h>
+#import <dispatch/dispatch.h>
 static BOOL isOnSpringBoard;
 // -1 means "don't touch the system value". Starting at 0.0 would make
 // emptySwitcherDismissDelay return a 0s delay before setResponse: ever runs,
@@ -133,9 +134,31 @@ static double reverseFolderSliderValue(double input){
 }
 
 
+//Volume HUD exemption ---------------------------------------------------------------
+//The stock volume HUD animates with the same SBFFluidBehaviorSettings that the app
+//open/close hooks modify, so it inherited the tweaked speed (it disappeared
+//abnormally fast). SpringBoard announces every volume change right before the HUD
+//(re)shows, and the HUD's show+hide animations are all configured within a couple
+//of seconds after that, so fluid settings touched during this short "active"
+//window belong to the volume HUD and must pass through unmodified.
+static NSInteger volumeHUDGeneration = 0;
+static BOOL volumeHUDActive = NO;
+
+static void noteVolumeHUDActivity(void){
+    volumeHUDActive = YES;
+    NSInteger generation = ++volumeHUDGeneration;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (volumeHUDGeneration == generation) volumeHUDActive = NO;
+    });
+}
+
 //App Open animation and bouncing
 %hook SBFFluidBehaviorSettings
     -(void)setResponse:(double)arg1{ //App open and close speed
+        if(volumeHUDActive){ //stock volume HUD: keep untouched, don't disturb switcher state
+            %orig;
+            return;
+        }
         if(isSpeedEnable){
             if(!isFineTuneSpeedEnable){
                 //Change speed value base on selector pos
@@ -195,7 +218,11 @@ static double reverseFolderSliderValue(double input){
             //SpringboardSpeed = -1;
         }
     }
-    -(void)setDampingRatio:(double)arg1{ //App open and close bouncing (has a small side effect on iOS 13 and above with stock volume hud)
+    -(void)setDampingRatio:(double)arg1{ //App open and close bouncing (volume HUD is exempted, see note above)
+        if(volumeHUDActive){ //stock volume HUD: keep untouched
+            %orig;
+            return;
+        }
         if(isBounceEnable){
             if(!isFineTuneBounceEnable){
                 switch (Bouncevalue){
@@ -249,6 +276,10 @@ static double reverseFolderSliderValue(double input){
     // }
 
     -(void)setDamping:(double)arg1{
+        if(volumeHUDActive){ //stock volume HUD: keep untouched
+            %orig;
+            return;
+        }
         if(isInstantFolder){
             %orig;
         }else{
@@ -262,6 +293,10 @@ static double reverseFolderSliderValue(double input){
 
     //folder mass
     -(void)setMass:(double)arg1{
+        if(volumeHUDActive){ //stock volume HUD: keep untouched
+            %orig;
+            return;
+        }
         if(isInstantFolder){
             %orig(arg1*0.0001);
         }else{
@@ -431,6 +466,17 @@ static double reverseFolderSliderValue(double input){
 
 %end
 
+//Direct HUD presentation as an extra trigger signal (class renamed to
+//SBVolumeControl on iOS 13+, so init the group with that class)
+%group VolumeHUDExempt
+%hook VolumeControl
+    - (void)_presentVolumeHUDWithVolume:(float)volume { //HUD is about to be presented
+        noteVolumeHUDActivity();
+        %orig;
+    }
+%end
+%end
+
 %ctor { //More pref
     // NSLog(@"[Speedster] load test");
     // CASpringAnimationClass = NSClassFromString(@"CASpringAnimation");
@@ -439,4 +485,13 @@ static double reverseFolderSliderValue(double input){
 
 	CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, (CFNotificationCallback)preferencesChanged, CFSTR("com.hoangdus.speedsterprefs-updated"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
 	preferencesChanged();
+
+	if (isOnSpringBoard) {
+		//Volume changes made from SpringBoard (hardware buttons etc.) are announced
+		//right before the volume HUD presents - use that as the exemption window trigger
+		[[NSNotificationCenter defaultCenter] addObserverForName:@"AVSystemController_SystemVolumeDidChangeNotification" object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note){
+			noteVolumeHUDActivity();
+		}];
+		%init(VolumeHUDExempt, VolumeControl = objc_getClass("SBVolumeControl"));
+	}
 }
