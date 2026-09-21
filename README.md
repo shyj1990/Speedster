@@ -4,7 +4,7 @@ Faster iOS animation.\
 An iOS extention(Tweak) that increases iOS animation speed.\
 Support iOS and iPadOS from 13 to 16 (newer might still be supported)
 
-[<img src="https://github.com/Hoangdus/Speedster/blob/main/havoc_get_square.png" alt="drawing" width="500"/>](https://havoc.app/package/speedster)
+
 
 Function
 ========
