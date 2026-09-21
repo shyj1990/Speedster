@@ -626,11 +626,14 @@ static void noteVolumeHUDActivity(NSString *source){
     }
 
     -(double)emptySwitcherDismissDelay{ //Switcher fix when set speed too high
-        if (SwitcherDismiss != -1){
-            return SwitcherDismiss;
-        }else{
+        //Volume HUD exemption: the HUD's auto-hide timing also flows through this
+        //fluid-framework delay, so while the HUD is active the stock delay must win
+        //or the HUD starts disappearing almost immediately (2.1.4-1 symptom: the
+        //hide ANIMATION was stock-speed after value restore, but it still began way early).
+        if (volumeHUDActive || SwitcherDismiss == -1){
             return %orig;
         }
+        return SwitcherDismiss;
     }
 %end
 
@@ -700,7 +703,7 @@ static void noteVolumeHUDActivity(NSString *source){
 		[@"" writeToFile:@"/var/mobile/Documents/speedster_debug.log" atomically:YES encoding:NSUTF8StringEncoding error:nil]; //reset diagnostic log each load
 
 		Class vc = objc_getClass("SBVolumeControl");
-		debugLog(@"ctor v2.1.4-1: SBVolumeControl=%@ present=%d inc=%d dec=%d handle=%d hide=%d", vc,
+		debugLog(@"ctor v2.1.4-2: SBVolumeControl=%@ present=%d inc=%d dec=%d handle=%d hide=%d", vc,
 			class_getInstanceMethod(vc, @selector(_presentVolumeHUDWithVolume:)) != NULL,
 			class_getInstanceMethod(vc, @selector(increaseVolume)) != NULL,
 			class_getInstanceMethod(vc, @selector(decreaseVolume)) != NULL,
