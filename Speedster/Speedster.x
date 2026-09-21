@@ -238,6 +238,15 @@ static NSMapTable *stockMassValues;
 static NSLock *stockValuesLock;
 static BOOL restoringForHUD = NO;
 
+//Silence the compiler for restore calls: the hooked setters exist at runtime on the
+//recorded objects, but the compiler only knows them from the %hook context.
+@interface NSObject (SpeedsterFluidSettings)
+- (void)setResponse:(double)arg1;
+- (void)setDampingRatio:(double)arg1;
+- (void)setDamping:(double)arg1;
+- (void)setMass:(double)arg1;
+@end
+
 static void initStockMaps(void){
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -691,7 +700,7 @@ static void noteVolumeHUDActivity(NSString *source){
 		[@"" writeToFile:@"/var/mobile/Documents/speedster_debug.log" atomically:YES encoding:NSUTF8StringEncoding error:nil]; //reset diagnostic log each load
 
 		Class vc = objc_getClass("SBVolumeControl");
-		debugLog(@"ctor v2.1.8: SBVolumeControl=%@ present=%d inc=%d dec=%d handle=%d hide=%d", vc,
+		debugLog(@"ctor v2.1.4-1: SBVolumeControl=%@ present=%d inc=%d dec=%d handle=%d hide=%d", vc,
 			class_getInstanceMethod(vc, @selector(_presentVolumeHUDWithVolume:)) != NULL,
 			class_getInstanceMethod(vc, @selector(increaseVolume)) != NULL,
 			class_getInstanceMethod(vc, @selector(decreaseVolume)) != NULL,
