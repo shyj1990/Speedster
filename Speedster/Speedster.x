@@ -237,8 +237,12 @@ static void noteVolumeHUDActivity(NSString *source){
 %hook SBFFluidBehaviorSettings
     -(void)setResponse:(double)arg1{ //App open and close speed
         if(isOnSpringBoard){
-            NSArray *dbgStack = [NSThread callStackSymbols];
-            debugLog(@"setResponse val=%.3f active=%d vcStack=%d stack=%@", arg1, volumeHUDActive, stackTouchesVolumeControl(), [dbgStack componentsJoinedByString:@" | "]);
+            if(stackTouchesVolumeControl()){ //rare; callStackSymbols is slow (caused 1s app-switch lag in 2.1.6), only pay it for volume-related calls
+                NSArray *dbgStack = [NSThread callStackSymbols];
+                debugLog(@"setResponse val=%.3f active=%d vcStack=1 stack=%@", arg1, volumeHUDActive, [dbgStack componentsJoinedByString:@" | "]);
+            }else{
+                debugLog(@"setResponse val=%.3f active=%d vcStack=0", arg1, volumeHUDActive);
+            }
         }
         if(volumeHUDActive){ //stock volume HUD: keep untouched, don't disturb switcher state
             %orig;
@@ -305,8 +309,12 @@ static void noteVolumeHUDActivity(NSString *source){
     }
     -(void)setDampingRatio:(double)arg1{ //App open and close bouncing (volume HUD is exempted, see note above)
         if(isOnSpringBoard){
-            NSArray *dbgStack = [NSThread callStackSymbols];
-            debugLog(@"setDampingRatio val=%.3f active=%d vcStack=%d stack=%@", arg1, volumeHUDActive, stackTouchesVolumeControl(), [dbgStack componentsJoinedByString:@" | "]);
+            if(stackTouchesVolumeControl()){
+                NSArray *dbgStack = [NSThread callStackSymbols];
+                debugLog(@"setDampingRatio val=%.3f active=%d vcStack=1 stack=%@", arg1, volumeHUDActive, [dbgStack componentsJoinedByString:@" | "]);
+            }else{
+                debugLog(@"setDampingRatio val=%.3f active=%d vcStack=0", arg1, volumeHUDActive);
+            }
         }
         if(volumeHUDActive){ //stock volume HUD: keep untouched
             %orig;
@@ -366,8 +374,12 @@ static void noteVolumeHUDActivity(NSString *source){
 
     -(void)setDamping:(double)arg1{
         if(isOnSpringBoard){
-            NSArray *dbgStack = [NSThread callStackSymbols];
-            debugLog(@"setDamping val=%.3f active=%d vcStack=%d stack=%@", arg1, volumeHUDActive, stackTouchesVolumeControl(), [dbgStack componentsJoinedByString:@" | "]);
+            if(stackTouchesVolumeControl()){
+                NSArray *dbgStack = [NSThread callStackSymbols];
+                debugLog(@"setDamping val=%.3f active=%d vcStack=1 stack=%@", arg1, volumeHUDActive, [dbgStack componentsJoinedByString:@" | "]);
+            }else{
+                debugLog(@"setDamping val=%.3f active=%d vcStack=0", arg1, volumeHUDActive);
+            }
         }
         if(volumeHUDActive){ //stock volume HUD: keep untouched
             %orig;
@@ -387,8 +399,12 @@ static void noteVolumeHUDActivity(NSString *source){
     //folder mass
     -(void)setMass:(double)arg1{
         if(isOnSpringBoard){
-            NSArray *dbgStack = [NSThread callStackSymbols];
-            debugLog(@"setMass val=%.3f active=%d vcStack=%d stack=%@", arg1, volumeHUDActive, stackTouchesVolumeControl(), [dbgStack componentsJoinedByString:@" | "]);
+            if(stackTouchesVolumeControl()){
+                NSArray *dbgStack = [NSThread callStackSymbols];
+                debugLog(@"setMass val=%.3f active=%d vcStack=1 stack=%@", arg1, volumeHUDActive, [dbgStack componentsJoinedByString:@" | "]);
+            }else{
+                debugLog(@"setMass val=%.3f active=%d vcStack=0", arg1, volumeHUDActive);
+            }
         }
         if(volumeHUDActive){ //stock volume HUD: keep untouched
             %orig;
