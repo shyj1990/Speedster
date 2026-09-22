@@ -109,10 +109,13 @@ static void preferencesChanged(){ //runs at load and every time the prefs darwin
 //fast end change the animation 3-7x more than the same step at the slow end.
 //With a constant-ratio curve, 1% of the track feels the same everywhere.
 //NOTE: saved slider values shift meaning once (re-set your sliders after update).
-static double reverseSpeedSliderValue(double input){ //track 0.05..0.40 -> response 0.40..0.05
+static double reverseSpeedSliderValue(double input){ //track 0.05..0.40 -> response 0.65..0.05
     double f = (input - 0.05) / 0.35; //0 = slowest end, 1 = fastest end
     f = MIN(MAX(f, 0.0), 1.0);
-    return 0.40 * pow(0.125, f); //8x total range -> constant 1.04% duration change per 1% track
+    //Slow end extended to 0.65 (clearly slower than the ~0.45 stock feel; the
+    //original author capped it at 0.40 = never slower than stock). 13x total
+    //range -> constant ~2.8% duration change per 1% of track.
+    return 0.65 * pow(0.0769, f);
 }
 
 static double reverseBounceSliderValue(double input){ //track 0.2..1.0 -> dampingRatio 0.9..0.1
@@ -126,10 +129,12 @@ static double reverseTurnOffSpeed(double input){
     return total - input; //plain fade duration: linear is perceptually fine
 }
 
-static double reverseAppSpeedSliderValue(double input){ //track 0..0.99 -> stock multiplier 1.0..0.1
+static double reverseAppSpeedSliderValue(double input){ //track 0..0.99 -> stock multiplier 1.5..0.1
     double f = input / 0.99;
     f = MIN(MAX(f, 0.0), 1.0);
-    double value = pow(0.1, f); //10x total range -> constant ratio per step
+    //Slow end extended to 1.5 (mass x1.5 = ~22% slower than stock; the original
+    //author capped it at 1.0 = never slower than stock). 15x total range.
+    double value = 1.5 * pow(0.0667, f);
     //Floor the multiplier: values below 0.1 make CASpringAnimation parameters
     //pathological (tiny mass/damping), which on iOS 17 + ProMotion (120Hz)
     //keeps springs recomputing frames and burns CPU.
@@ -139,10 +144,10 @@ static double reverseAppSpeedSliderValue(double input){ //track 0..0.99 -> stock
     return value;
 }
 
-static double reverseFolderSliderValue(double input){ //track 0..0.9 -> stock multiplier 1.0..0.1
+static double reverseFolderSliderValue(double input){ //track 0..0.9 -> stock multiplier 1.5..0.1
     double f = input / 0.9;
     f = MIN(MAX(f, 0.0), 1.0);
-    return pow(0.1, f); //same constant-ratio curve as the in-app sliders
+    return 1.5 * pow(0.0667, f); //same extended constant-ratio curve as in-app
 }
 
 
