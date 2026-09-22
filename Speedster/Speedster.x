@@ -109,13 +109,13 @@ static void preferencesChanged(){ //runs at load and every time the prefs darwin
 //fast end change the animation 3-7x more than the same step at the slow end.
 //With a constant-ratio curve, 1% of the track feels the same everywhere.
 //NOTE: saved slider values shift meaning once (re-set your sliders after update).
-static double reverseSpeedSliderValue(double input){ //track 0.05..0.40 -> response 0.65..0.05
+static double reverseSpeedSliderValue(double input){ //track 0.05..0.40 -> response 0.45..0.15
     double f = (input - 0.05) / 0.35; //0 = slowest end, 1 = fastest end
     f = MIN(MAX(f, 0.0), 1.0);
-    //Slow end extended to 0.65 (clearly slower than the ~0.45 stock feel; the
-    //original author capped it at 0.40 = never slower than stock). 13x total
-    //range -> constant ~2.8% duration change per 1% of track.
-    return 0.65 * pow(0.0769, f);
+    //Per user preference: 0% = exactly stock (~0.45), and the fast end is capped
+    //at 0.15 (3x stock) instead of the original 0.05 (9x). 3x total range ->
+    //constant ~1.1% duration change per 1% of track (very fine-grained).
+    return 0.45 * pow(0.3333, f);
 }
 
 static double reverseBounceSliderValue(double input){ //track 0.2..1.0 -> dampingRatio 0.9..0.1
