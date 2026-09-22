@@ -118,10 +118,12 @@ static double reverseSpeedSliderValue(double input){ //track 0.05..0.40 -> respo
     return 0.45 * pow(0.3333, f);
 }
 
-static double reverseBounceSliderValue(double input){ //track 0.2..1.0 -> dampingRatio 0.9..0.1
+static double reverseBounceSliderValue(double input){ //track 0.2..1.0 -> dampingRatio 0.9..0.2
     double f = (input - 0.2) / 0.8;
     f = MIN(MAX(f, 0.0), 1.0);
-    return 0.9 * pow(0.1111, f); //9x total range -> uniform bounce feel per step
+    //0% = stock feel (dampingRatio ~0.9, no extra bounce); bouncy end capped at
+    //0.2 (the most bouncy preset) instead of the original 0.1 (endless wobble).
+    return 0.9 * pow(0.2222, f);
 }
 
 static double reverseTurnOffSpeed(double input){
@@ -129,12 +131,12 @@ static double reverseTurnOffSpeed(double input){
     return total - input; //plain fade duration: linear is perceptually fine
 }
 
-static double reverseAppSpeedSliderValue(double input){ //track 0..0.99 -> stock multiplier 1.5..0.1
+static double reverseAppSpeedSliderValue(double input){ //track 0..0.99 -> stock multiplier 1.0..0.1
     double f = input / 0.99;
     f = MIN(MAX(f, 0.0), 1.0);
-    //Slow end extended to 1.5 (mass x1.5 = ~22% slower than stock; the original
-    //author capped it at 1.0 = never slower than stock). 15x total range.
-    double value = 1.5 * pow(0.0667, f);
+    //0% = exactly stock (x1.0); fast end capped at x0.1 (springs ~3.2x faster,
+    //matching the app open/close 3x cap philosophy).
+    double value = pow(0.1, f);
     //Floor the multiplier: values below 0.1 make CASpringAnimation parameters
     //pathological (tiny mass/damping), which on iOS 17 + ProMotion (120Hz)
     //keeps springs recomputing frames and burns CPU.
@@ -144,10 +146,10 @@ static double reverseAppSpeedSliderValue(double input){ //track 0..0.99 -> stock
     return value;
 }
 
-static double reverseFolderSliderValue(double input){ //track 0..0.9 -> stock multiplier 1.5..0.1
+static double reverseFolderSliderValue(double input){ //track 0..0.9 -> stock multiplier 1.0..0.1
     double f = input / 0.9;
     f = MIN(MAX(f, 0.0), 1.0);
-    return 1.5 * pow(0.0667, f); //same extended constant-ratio curve as in-app
+    return pow(0.1, f); //0% = exactly stock, fast end capped, same as in-app
 }
 
 
