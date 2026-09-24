@@ -2,6 +2,8 @@
 #import <dispatch/dispatch.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <execinfo.h>
+#import <dlfcn.h>
 #import <stdio.h>
 #import <stdarg.h>
 static BOOL isOnSpringBoard;
@@ -370,11 +372,103 @@ static BOOL queryUILocked(void){
     return !!((BOOL(*)(id, SEL))objc_msgSend)(mgr, @selector(isUILocked));
 }
 
+//Fluid-10 storm caller identification: Fluid-9 device logs killed the wake-multiplier
+//theory - the storm fires ~2s after the lock screen becomes visible even when NO wake
+//getter is ever read (boot session), and every value flowing through the hooked setters
+//during the storm is stock. So the disease is not the value but the CALLER: something
+//re-presents the lock pill endlessly. Capture the call stack of the storm's setter
+//calls and resolve frames through a lazily-built IMP -> [Class selector] map of every
+//ObjC method loaded in SpringBoard. 3 samples per lock session (call #1/#150/#400)
+//cover the storm's beginning, middle and end.
+static NSArray *traceSortedImps;   //ascending IMPs
+static NSArray *traceSortedNames;  //parallel "[Class selector]" strings
+static volatile BOOL traceMapReady = NO;
+static NSInteger stormTraceCount = 0;
+
+static void buildImpSymbolMap(void){
+    @autoreleasepool {
+        NSMutableArray *imps = [NSMutableArray array];
+        NSMutableArray *names = [NSMutableArray array];
+        unsigned int count = 0;
+        Class *classes = objc_copyClassList(&count);
+        for (unsigned int i = 0; i < count; i++) {
+            @autoreleasepool {
+                unsigned int mCount = 0;
+                Method *methods = class_copyMethodList(classes[i], &mCount);
+                for (unsigned int j = 0; j < mCount; j++) {
+                    IMP imp = method_getImplementation(methods[j]);
+                    if (imp) {
+                        [imps addObject:@((uintptr_t)imp)];
+                        [names addObject:[NSString stringWithFormat:@"[%@ %@]",
+                            NSStringFromClass(classes[i]),
+                            NSStringFromSelector(method_getName(methods[j]))]];
+                    }
+                }
+                if (methods) free(methods);
+            }
+        }
+        if (classes) free(classes);
+        NSMutableArray *pairs = [NSMutableArray arrayWithCapacity:imps.count];
+        for (NSUInteger i = 0; i < imps.count; i++) {
+            [pairs addObject:@[@[imps[i], names[i]]]];
+        }
+        [pairs sortUsingComparator:^NSComparisonResult(NSArray *a, NSArray *b){
+            return [a[0] compare:b[0]];
+        }];
+        NSMutableArray *sortedI = [NSMutableArray arrayWithCapacity:pairs.count];
+        NSMutableArray *sortedN = [NSMutableArray arrayWithCapacity:pairs.count];
+        for (NSArray *p in pairs) {
+            [sortedI addObject:p[0]];
+            [sortedN addObject:p[1]];
+        }
+        traceSortedImps = sortedI;
+        traceSortedNames = sortedN;
+        diagLog(@"imp symbol map built: %lu methods", (unsigned long)sortedI.count);
+        traceMapReady = YES;
+    }
+}
+
+//Nearest method at or below addr (method sizes are unknown; floor match is standard).
+static NSString *symbolForAddr(void *addr){
+    if (!traceMapReady) return nil;
+    NSUInteger lo = 0, hi = traceSortedImps.count;
+    uintptr_t target = (uintptr_t)addr;
+    while (lo < hi) {
+        NSUInteger mid = (lo + hi) / 2;
+        if ([traceSortedImps[mid] unsignedLongValue] <= target) lo = mid + 1; else hi = mid;
+    }
+    if (lo == 0) return nil;
+    return traceSortedNames[lo - 1];
+}
+
+static void logStormTrace(void){
+    void *frames[32] = {0};
+    int n = backtrace(frames, 32);
+    NSMutableString *line = [NSMutableString stringWithFormat:@"storm trace (call #%ld, %d frames):", (long)stormTraceCount, n];
+    for (int i = 2; i < n && i < 18; i++) { //skip our own hook + orig thunk frames
+        NSString *sym = symbolForAddr(frames[i]);
+        if (sym) {
+            [line appendFormat:@" <- %@", sym];
+        } else {
+            Dl_info info;
+            if (dladdr(frames[i], &info) && info.dli_fname) {
+                const char *base = strrchr(info.dli_fname, '/');
+                [line appendFormat:@" <- %s!%p", base ? base + 1 : info.dli_fname,
+                    (void *)((uintptr_t)frames[i] - (uintptr_t)info.dli_fbase)];
+            } else {
+                [line appendFormat:@" <- %p", frames[i]];
+            }
+        }
+    }
+    diagLog(@"%@", line);
+}
+
 static void setDeviceLocked(BOOL locked, const char *source){
     if (locked == deviceLocked) return;
     diagLog(@"deviceLocked %d -> %d (%s)", deviceLocked, locked, source);
     deviceLocked = locked;
     diagBudget = 500; //fresh log budget per lock session
+    stormTraceCount = 0; //fresh storm-trace samples per lock session
     restoreStockValuesForHUD(@"lock");
 }
 
@@ -425,6 +519,8 @@ static void startLockPolling(void){
         }
         if(deviceLocked){ //lock-screen island/UI (e.g. lock pill) animations run stock
             diagLogB(@"setResponse %g while locked (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self);
+            stormTraceCount++;
+            if (stormTraceCount == 1 || stormTraceCount == 150 || stormTraceCount == 400) logStormTrace();
             %orig;
             return;
         }
@@ -923,7 +1019,10 @@ static void startLockPolling(void){
 		diagLogPath = @"/var/mobile/Library/SpeedsterDiag.log";
 		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring
 		diagBudget = 500; //budget for the pre-first-transition (locked after respring) session
-		diagLog(@"Speedster Fluid-9 loaded, deviceLocked(assumed)=%d", deviceLocked);
+		diagLog(@"Speedster Fluid-10 loaded, deviceLocked(assumed)=%d", deviceLocked);
+		//Build the IMP symbol map in the background so storm traces can be resolved
+		//(takes a few seconds; the boot storm may beat it - later sessions are covered)
+		dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ buildImpSymbolMap(); });
 		Class lockMgrClass = objc_getClass("SBLockScreenManager");
 		if (lockMgrClass) {
 			%init(LockScreenTracker, SBLockScreenManager = lockMgrClass);
