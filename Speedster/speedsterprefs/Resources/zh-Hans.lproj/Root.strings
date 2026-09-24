@@ -14,12 +14,6 @@
 
 "FineTuneSpeed" = "微调速度";
 
-"Folder" = "文件夹打开/关闭";
-
-"FolderAnimation" = "文件夹打开/关闭速度";
-
-"FolderDamping" = "回弹效果";
-
 "Icon edit shaking" = "编辑模式图标抖动";
 
 "Icon unlock fly in" = "解锁时图标飞入";
@@ -27,8 +21,6 @@
 "InAppMass" = "应用内速度";
 
 "InAppAnimation" = "应用内动画";
-
-"InstantFolder" = "文件夹秒开";
 
 "Links" = "链接";
 

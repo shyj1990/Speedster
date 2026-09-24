@@ -21,16 +21,8 @@
 "FineTuneSpeed" = "Tuỳ chỉnh tốc độ bằng tay";
 
 
-"Folder" = "Thư mục (Đóng/Mở)";
 
 
-"FolderAnimation" = "Tốc độ thư mục";
-
-
-"FolderDamping" = "Độ nảy";
-
-
-"FolderMass" = "Trọng lượng hoạt ảnh";
 
 
 "Icon edit shaking" = "Icon rung khi chỉnh vị trí";
@@ -47,8 +39,6 @@
 
 "InAppMass" = "Tốc độ trong app";
 
-
-"InstantFolder" = "Tắt hoạt ảnh mở thư mục";
 
 
 "Links" = "Link";

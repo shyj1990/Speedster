@@ -21,13 +21,7 @@
 "FineTuneSpeed" = "Fine Tune Speed";
 
 
-"Folder" = "Folder Open/Close";
 
-
-"FolderAnimation" = "Folder Open/Close Speed";
-
-
-"FolderDamping" = "Bounce";
 
 
 "Icon edit shaking" = "Icon Edit Shaking";
@@ -41,8 +35,6 @@
 
 "InAppAnimation" = "In App Speed";
 
-
-"InstantFolder" = "Instant Folder";
 
 
 "Links" = "Links";

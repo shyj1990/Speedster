@@ -910,7 +910,7 @@ static void startLockPolling(void){
 		diagLogPath = @"/var/mobile/Library/SpeedsterDiag.log";
 		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring
 		diagBudget = 500; //budget for the pre-first-transition (locked after respring) session
-		diagLog(@"Speedster Fluid-17 loaded, deviceLocked(assumed)=%d", deviceLocked);
+		diagLog(@"Speedster Fluid-19 loaded, deviceLocked(assumed)=%d", deviceLocked);
 		Class lockMgrClass = objc_getClass("SBLockScreenManager");
 		if (lockMgrClass) {
 			%init(LockScreenTracker, SBLockScreenManager = lockMgrClass);
