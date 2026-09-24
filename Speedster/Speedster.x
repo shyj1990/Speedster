@@ -704,6 +704,18 @@ static void startLockPolling(void){
 // %end
 
 //Screen Turn On and Off Speed
+//Fluid-9 ROOT CAUSE (device-log proven): the lock pill flip-flop storm is driven by
+//SBFWakeAnimationSettings getters, NOT by any fluid setter. Fluid-8 logs show the storm
+//starts exactly at the wake read: backlightFadeDuration -> 0.01 and
+//speedMultiplierForWake -> 100 (the slider's raw value used as an animation multiplier),
+//followed by ~500 SBFFluidBehaviorSettings reconfigurations in 2.5s on recurring objects
+//- the pill's show/hide animations complete instantly at 100x, the island state machine
+//re-presents them endlessly (~30 cycles/s), and gives up after ~10s (user report).
+//Every storm value passed through our locked exemption was stock, which is why the
+//setter exemptions (Fluid-6/7/8) could never help. Fix: clamp the wake multiplier to
+//the same 3x cap philosophy as every other Speedster slider, and floor the fade
+//duration at 0.15s (imperceptible vs the user's 0.01s, removes the secondary suspect).
+//Both clamps are logged so a future log can verify the storm is gone.
 %hook SBFWakeAnimationSettings
     -(double)backlightFadeDuration{ //Screen turn off speed
         double v;
@@ -712,8 +724,10 @@ static void startLockPolling(void){
         }else{
             v = %orig;
         }
-        //Fluid-8: these three getters are the ONLY values still tweaked while locked -
-        //log every locked-phase read (budgeted) to prove whether the flash loop reads them.
+        if(v < 0.15){
+            diagLog(@"clamped backlightFadeDuration %g -> 0.15", v);
+            v = 0.15;
+        }
         if(deviceLocked){
             diagLogB(@"backlightFadeDuration -> %g (%@)", v, NSStringFromClass([(id)self class]));
         }else{
@@ -728,6 +742,12 @@ static void startLockPolling(void){
         }else{
             v = %orig;
         }
+        if(v > 3.0){
+            diagLog(@"clamped speedMultiplierForWake %g -> 3", v);
+            v = 3.0;
+        }else if(v < 1.0){
+            v = 1.0;
+        }
         if(deviceLocked){
             diagLogB(@"speedMultiplierForWake -> %g (%@)", v, NSStringFromClass([(id)self class]));
         }else{
@@ -741,6 +761,12 @@ static void startLockPolling(void){
             v = Screenwakevalue;
         }else{
             v = %orig;
+        }
+        if(v > 3.0){
+            diagLog(@"clamped speedMultiplierForLiftToWake %g -> 3", v);
+            v = 3.0;
+        }else if(v < 1.0){
+            v = 1.0;
         }
         if(deviceLocked){
             diagLogB(@"speedMultiplierForLiftToWake -> %g (%@)", v, NSStringFromClass([(id)self class]));
@@ -897,7 +923,7 @@ static void startLockPolling(void){
 		diagLogPath = @"/var/mobile/Library/SpeedsterDiag.log";
 		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring
 		diagBudget = 500; //budget for the pre-first-transition (locked after respring) session
-		diagLog(@"Speedster Fluid-8 loaded, deviceLocked(assumed)=%d", deviceLocked);
+		diagLog(@"Speedster Fluid-9 loaded, deviceLocked(assumed)=%d", deviceLocked);
 		Class lockMgrClass = objc_getClass("SBLockScreenManager");
 		if (lockMgrClass) {
 			%init(LockScreenTracker, SBLockScreenManager = lockMgrClass);
