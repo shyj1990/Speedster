@@ -385,6 +385,9 @@ static NSArray *traceSortedNames;  //parallel "[Class selector]" strings
 static volatile BOOL traceMapReady = NO;
 static NSInteger stormTraceCount = 0;
 
+static NSString *symbolForAddr(void *addr);
+static void dumpSymbolMapFile(void);
+
 static void buildImpSymbolMap(void){
     @autoreleasepool {
         NSMutableArray *imps = [NSMutableArray array];
