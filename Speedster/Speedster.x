@@ -233,6 +233,11 @@ static void initStockMaps(void){
     });
 }
 
+//Diag logging lives below (lock exemption section); forward-declared because the
+//stock-restore above logs its map sizes too.
+static void diagLog(NSString *fmt, ...);
+static void diagLogB(NSString *fmt, ...);
+
 static void recordStockValue(NSMapTable *map, id object, double value){
     if (!isOnSpringBoard) return;
     initStockMaps();
@@ -241,9 +246,12 @@ static void recordStockValue(NSMapTable *map, id object, double value){
     [stockValuesLock unlock];
 }
 
-static void restoreStockValuesForHUD(void){
+static void restoreStockValuesForHUD(NSString *reason){
     if (!isOnSpringBoard) return;
     initStockMaps();
+    diagLog(@"restore(%@): response=%lu dampingRatio=%lu damping=%lu mass=%lu", reason,
+            (unsigned long)[stockResponseValues count], (unsigned long)[stockDampingRatioValues count],
+            (unsigned long)[stockDampingValues count], (unsigned long)[stockMassValues count]);
     [stockValuesLock lock];
     restoringForHUD = YES; //hooks pass straight through to %orig while restoring
     for (id obj in stockResponseValues) {
@@ -268,7 +276,7 @@ static void restoreStockValuesForHUD(void){
 
 static void noteVolumeHUDActivity(void){
     volumeHUDActive = YES;
-    restoreStockValuesForHUD();
+    restoreStockValuesForHUD(@"volume");
     NSInteger generation = ++volumeHUDGeneration;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (volumeHUDGeneration == generation) volumeHUDActive = NO;
@@ -287,6 +295,13 @@ static void noteVolumeHUDActivity(void){
 //(2) a 0.5s authoritative poll (converges even if hooks/notifications ever fail), and
 //(3) the lockcomplete darwin notification as a bonus. On change we also run the
 //volume-HUD-style stock restore so the lock pill reads clean fluid settings objects.
+//Fluid-7 device result: lock tracking + stock pass-through all WORK (log-verified), yet
+//the pill still flashes. The 40-line log budget was consumed entirely by the ~40-line
+//wake burst, so the loop's own calls (if any) were invisible. Fluid-8 is a
+//diagnostics-first build, no behavior change: 500-line budget, class names on every
+//line, unlocked-phase per-class sampling (frozen-copy hunt), locked-phase logging of
+//the wake getters (the only values still tweaked while locked), and a 10s heartbeat
+//that proves silence during the flash is real.
 //Diag logging (this build only): /var/mobile/Library/SpeedsterDiag.log, fresh per
 //respring, budgeted while locked so it can never spam per-frame.
 static volatile BOOL deviceLocked = YES; //SpringBoard always launches into the lock screen
@@ -313,13 +328,38 @@ static void diagLog(NSString *fmt, ...){
     va_end(args);
 }
 
-//Budgeted variant for potentially chatty call sites (40 lines per lock session max)
+//Budgeted variant for potentially chatty call sites (500 lines per lock session max).
+//Fluid-7 lesson: the 40-line budget was eaten by the ~40-line wake burst alone, so
+//everything the flash loop did AFTER the burst went unlogged and silence during the
+//flash was indistinguishable from budget starvation.
 static void diagLogB(NSString *fmt, ...){
     if (diagBudget <= 0) return;
     diagBudget--;
     va_list args; va_start(args, fmt);
     diagLogCore(fmt, args);
     va_end(args);
+}
+
+//Fluid-8 unlocked-phase sampling: one line per (selector, class) pair. The flash loop
+//most likely runs on a value some controller FROZE out of a settings object while the
+//device was unlocked (same disease as the volume HUD's launch-time freeze), so we need
+//to know every class that flows through the hooked setters during normal use.
+//Instances are created per-animation, so the class name is the only stable identity.
+static NSMutableSet *diagUniqueLogged;
+static void diagLogClassOnce(NSString *tag, id obj, double value){
+    if (!isOnSpringBoard || !obj || deviceLocked) return;
+    initStockMaps();
+    NSString *className = NSStringFromClass([obj class]);
+    NSString *key = [NSString stringWithFormat:@"%@|%@", tag, className];
+    BOOL shouldLog = NO;
+    [stockValuesLock lock];
+    if (!diagUniqueLogged) diagUniqueLogged = [NSMutableSet new];
+    if ([diagUniqueLogged count] < 64 && ![diagUniqueLogged containsObject:key]) {
+        [diagUniqueLogged addObject:key];
+        shouldLog = YES;
+    }
+    [stockValuesLock unlock];
+    if (shouldLog) diagLog(@"[unlocked] %@ on %@ value=%g", tag, className, value);
 }
 
 static BOOL queryUILocked(void){
@@ -334,8 +374,8 @@ static void setDeviceLocked(BOOL locked, const char *source){
     if (locked == deviceLocked) return;
     diagLog(@"deviceLocked %d -> %d (%s)", deviceLocked, locked, source);
     deviceLocked = locked;
-    diagBudget = 40; //fresh log budget per lock session
-    restoreStockValuesForHUD();
+    diagBudget = 500; //fresh log budget per lock session
+    restoreStockValuesForHUD(@"lock");
 }
 
 static void lockCompleteDarwinCallback(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo){
@@ -354,8 +394,15 @@ static void startLockPolling(void){
     dispatch_source_set_timer(lockPollTimer,
                               dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
                               (int64_t)(0.5 * NSEC_PER_SEC), 0);
+    __block NSInteger heartbeatTicks = 0;
     dispatch_source_set_event_handler(lockPollTimer, ^{
         setDeviceLocked(queryUILocked(), "poll");
+        //Fluid-8: positive-evidence heartbeat. If the flash loop keeps running while this
+        //reports budget left, the loop provably makes NO hooked setter calls at all ->
+        //frozen-copy/controller-cache disease, not a settings-object disease.
+        if (deviceLocked && (++heartbeatTicks % 20) == 0) {
+            diagLog(@"heartbeat: locked, diagBudget left=%ld", (long)diagBudget);
+        }
     });
     dispatch_resume(lockPollTimer);
 }
@@ -366,6 +413,7 @@ static void startLockPolling(void){
         if(restoringForHUD){ %orig; return; }
         if(isOnSpringBoard){
             recordStockValue(stockResponseValues, self, arg1);
+            diagLogClassOnce(@"setResponse", self, arg1);
             if(bootGraceActive()){
                 %orig;
                 return;
@@ -376,7 +424,7 @@ static void startLockPolling(void){
             return;
         }
         if(deviceLocked){ //lock-screen island/UI (e.g. lock pill) animations run stock
-            diagLogB(@"setResponse %g while locked (self=%p)", arg1, self);
+            diagLogB(@"setResponse %g while locked (%@ self=%p)", arg1, NSStringFromClass([self class]), self);
             %orig;
             return;
         }
@@ -443,6 +491,7 @@ static void startLockPolling(void){
         if(restoringForHUD){ %orig; return; }
         if(isOnSpringBoard){
             recordStockValue(stockDampingRatioValues, self, arg1);
+            diagLogClassOnce(@"setDampingRatio", self, arg1);
             if(bootGraceActive()){
                 %orig;
                 return;
@@ -453,7 +502,7 @@ static void startLockPolling(void){
             return;
         }
         if(deviceLocked){ //lock-screen island/UI (e.g. lock pill) animations run stock
-            diagLogB(@"setDampingRatio %g while locked (self=%p)", arg1, self);
+            diagLogB(@"setDampingRatio %g while locked (%@ self=%p)", arg1, NSStringFromClass([self class]), self);
             %orig;
             return;
         }
@@ -513,6 +562,7 @@ static void startLockPolling(void){
         if(restoringForHUD){ %orig; return; }
         if(isOnSpringBoard){
             recordStockValue(stockDampingValues, self, arg1);
+            diagLogClassOnce(@"setDamping", self, arg1);
             if(bootGraceActive()){
                 %orig;
                 return;
@@ -523,7 +573,7 @@ static void startLockPolling(void){
             return;
         }
         if(deviceLocked){ //lock-screen animations run stock
-            diagLogB(@"SBFAnimationSettings setDamping %g while locked (self=%p)", arg1, self);
+            diagLogB(@"SBFAnimationSettings setDamping %g while locked (%@ self=%p)", arg1, NSStringFromClass([self class]), self);
             %orig;
             return;
         }
@@ -543,6 +593,7 @@ static void startLockPolling(void){
         if(restoringForHUD){ %orig; return; }
         if(isOnSpringBoard){
             recordStockValue(stockMassValues, self, arg1);
+            diagLogClassOnce(@"setMass", self, arg1);
             if(bootGraceActive()){
                 %orig;
                 return;
@@ -553,7 +604,7 @@ static void startLockPolling(void){
             return;
         }
         if(deviceLocked){ //lock-screen animations run stock
-            diagLogB(@"SBFAnimationSettings setMass %g while locked (self=%p)", arg1, self);
+            diagLogB(@"SBFAnimationSettings setMass %g while locked (%@ self=%p)", arg1, NSStringFromClass([self class]), self);
             %orig;
             return;
         }
@@ -655,25 +706,48 @@ static void startLockPolling(void){
 //Screen Turn On and Off Speed
 %hook SBFWakeAnimationSettings
     -(double)backlightFadeDuration{ //Screen turn off speed
+        double v;
         if(isScreensleepEnable){
-            return reverseTurnOffSpeed(Screensleepvalue);
+            v = reverseTurnOffSpeed(Screensleepvalue);
         }else{
-            return %orig;
+            v = %orig;
         }
+        //Fluid-8: these three getters are the ONLY values still tweaked while locked -
+        //log every locked-phase read (budgeted) to prove whether the flash loop reads them.
+        if(deviceLocked){
+            diagLogB(@"backlightFadeDuration -> %g (%@)", v, NSStringFromClass([self class]));
+        }else{
+            diagLogClassOnce(@"backlightFadeDuration", self, v);
+        }
+        return v;
     }
     -(double)speedMultiplierForWake{ //Screen turn on speed (might be glitchy)
+        double v;
         if(isScreenwakeEnable){
-            return Screenwakevalue;
+            v = Screenwakevalue;
         }else{
-            return %orig;
+            v = %orig;
         }
+        if(deviceLocked){
+            diagLogB(@"speedMultiplierForWake -> %g (%@)", v, NSStringFromClass([self class]));
+        }else{
+            diagLogClassOnce(@"speedMultiplierForWake", self, v);
+        }
+        return v;
     }
     -(double)speedMultiplierForLiftToWake{ //Screen turn on speed but for lift to wake (again might be glitchy)
+        double v;
         if(isScreenwakeEnable){
-            return Screenwakevalue;
+            v = Screenwakevalue;
         }else{
-            return %orig;
+            v = %orig;
         }
+        if(deviceLocked){
+            diagLogB(@"speedMultiplierForLiftToWake -> %g (%@)", v, NSStringFromClass([self class]));
+        }else{
+            diagLogClassOnce(@"speedMultiplierForLiftToWake", self, v);
+        }
+        return v;
     }
 %end
 
@@ -702,7 +776,7 @@ static void startLockPolling(void){
         //the stock delay always wins there.
         if (isOnSpringBoard && deviceLocked){
             double stock = %orig;
-            diagLogB(@"dismissDelay while locked -> stock %g (SwitcherDismiss=%g)", stock, SwitcherDismiss);
+            diagLogB(@"dismissDelay while locked -> stock %g (SwitcherDismiss=%g, %@)", stock, SwitcherDismiss, NSStringFromClass([self class]));
             return stock;
         }
         //Volume HUD exemption: the HUD's auto-hide timing also flows through this
@@ -822,8 +896,8 @@ static void startLockPolling(void){
 		//Lock screen exemption wiring (see the lock exemption note above)
 		diagLogPath = @"/var/mobile/Library/SpeedsterDiag.log";
 		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring
-		diagBudget = 60; //budget for the pre-first-transition (locked after respring) session
-		diagLog(@"Speedster Fluid-7 loaded, deviceLocked(assumed)=%d", deviceLocked);
+		diagBudget = 500; //budget for the pre-first-transition (locked after respring) session
+		diagLog(@"Speedster Fluid-8 loaded, deviceLocked(assumed)=%d", deviceLocked);
 		Class lockMgrClass = objc_getClass("SBLockScreenManager");
 		if (lockMgrClass) {
 			%init(LockScreenTracker, SBLockScreenManager = lockMgrClass);
