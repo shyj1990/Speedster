@@ -215,6 +215,19 @@ static BOOL bootGraceActive(void){
     return YES;
 }
 
+//Fluid-14 unlock grace: for a short window right after the unlock transition completes,
+//keep every SpringBoard-facing hook at stock. The lock pill collapses during the unlock
+//transition and may (re)configure its presentation settings just after the state flips;
+//any tweaked value it picks up there gets frozen into its own state and replays as the
+//endless silent flash on the next lock. Cost: app animations in the first 0.6s after
+//unlock run at stock speed (barely noticeable, the unlock flow lands on the home screen).
+static CFAbsoluteTime unlockTransitionTime = 0;
+static BOOL unlockGraceActive(void){
+    if (!isOnSpringBoard || deviceLocked) return NO;
+    if (unlockTransitionTime == 0) return NO;
+    return (CFAbsoluteTimeGetCurrent() - unlockTransitionTime) < 0.6;
+}
+
 //Silence the compiler for restore calls: the hooked setters exist at runtime on the
 //recorded objects, but the compiler only knows them from the %hook context.
 @interface NSObject (SpeedsterFluidSettings)
@@ -534,9 +547,16 @@ static void setDeviceLocked(BOOL locked, const char *source){
     if (locked == deviceLocked) return;
     diagLog(@"deviceLocked %d -> %d (%s)", deviceLocked, locked, source);
     deviceLocked = locked;
+    if (!locked) unlockTransitionTime = CFAbsoluteTimeGetCurrent();
     diagBudget = 500; //fresh log budget per lock session
     stormTraceCount = 0; //fresh storm-trace samples per lock session
-    restoreStockValuesForHUD(@"lock");
+    //Fluid-14: the lock pill's animation config is read INSIDE %orig of the lock call,
+    //i.e. BEFORE this function used to run at the hook's tail - so every lock started
+    //with the pill reading unlock-period tweaked object values and freezing them into
+    //its own presentation state (the endless silent flash). On LOCK the restore must
+    //run BEFORE the lock machinery; the SBLockScreenManager hooks below were reordered
+    //accordingly. This function stays as the authoritative state/restore entry.
+    restoreStockValuesForHUD(locked ? @"lock" : @"unlock");
 }
 
 static void lockCompleteDarwinCallback(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo){
@@ -576,6 +596,10 @@ static void startLockPolling(void){
             recordStockValue(stockResponseValues, self, arg1);
             diagLogClassOnce(@"setResponse", self, arg1);
             if(bootGraceActive()){
+                %orig;
+                return;
+            }
+            if(unlockGraceActive()){ //Fluid-14: just-unlocked boundary stays stock
                 %orig;
                 return;
             }
@@ -622,6 +646,11 @@ static void startLockPolling(void){
                 }
             }else{
                 //Fine Tune Mode
+                if(FineTuneSpeedValue <= 0.0005){ //Fluid-14: 0% = never touch the object (true stock kill switch)
+                    %orig;
+                    SwitcherDismiss = -1;
+                    return;
+                }
                 %orig(reverseSpeedSliderValue(FineTuneSpeedValue));
                 //Check Speed Value and change SpringBoard and Switcher Dismiss speed accordingly
                 if (reverseSpeedSliderValue(FineTuneSpeedValue) < 0.4 && reverseSpeedSliderValue(FineTuneSpeedValue) >= 0.37){
@@ -659,6 +688,10 @@ static void startLockPolling(void){
                 %orig;
                 return;
             }
+            if(unlockGraceActive()){ //Fluid-14: just-unlocked boundary stays stock
+                %orig;
+                return;
+            }
         }
         if(volumeHUDActive){ //stock volume HUD: keep untouched
             %orig;
@@ -692,6 +725,10 @@ static void startLockPolling(void){
                         break;    
                 }
             }else{
+                if(FineTuneBounceValue <= 0.0005){ //Fluid-14: 0% = never touch the object (true stock kill switch)
+                    %orig;
+                    return;
+                }
                 %orig(reverseBounceSliderValue(FineTuneBounceValue));
             }
         }else{
@@ -730,6 +767,10 @@ static void startLockPolling(void){
                 %orig;
                 return;
             }
+            if(unlockGraceActive()){ //Fluid-14: just-unlocked boundary stays stock
+                %orig;
+                return;
+            }
         }
         if(volumeHUDActive){ //stock volume HUD: keep untouched
             %orig;
@@ -758,6 +799,10 @@ static void startLockPolling(void){
             recordStockValue(stockMassValues, self, arg1);
             diagLogClassOnce(@"setMass", self, arg1);
             if(bootGraceActive()){
+                %orig;
+                return;
+            }
+            if(unlockGraceActive()){ //Fluid-14: just-unlocked boundary stays stock
                 %orig;
                 return;
             }
@@ -871,6 +916,12 @@ static void startLockPolling(void){
 //multiplier breaks the lock pill's presentation state machine - the pill's show/hide
 //animations complete faster than the island expects, so it re-presents endlessly
 //(100x = violent flip-flop, 3x = still flip-flops; Fluid-9's clamp wasn't enough).
+//Fluid-14 correction: the wake multiplier was NOT the root cause either. The Fluid-13
+//device log proved every hooked value path returns stock while locked AND the flash
+//loop makes zero hooked calls (heartbeat budget untouched) - the pill freezes tweaked
+//values captured at the lock transition, where %orig (the lock machinery that configures
+//the pill) ran BEFORE the stock restore. Fix = restore-before-%orig on lock + unlock
+//grace window + 0%-means-untouched kill switch. See SBLockScreenManager hooks below.
 //The settings-object "storm" in earlier logs is a red herring: it also fires during
 //the boot grace window when every hook is a pure pass-through. Meanwhile the wake
 //multiplier was the ONLY time-varying tweaked value left while locked, and it is
@@ -880,7 +931,7 @@ static void startLockPolling(void){
 //This unavoidably disables 亮屏加速 on the lock screen - iOS 17 hard conflict.
 %hook SBFWakeAnimationSettings
     -(double)backlightFadeDuration{ //Screen turn off speed
-        if(deviceLocked){ //lock screen: pure stock, the pill state machine is sensitive
+        if(deviceLocked || unlockGraceActive()){ //lock screen: pure stock, the pill state machine is sensitive
             double stock = %orig;
             diagLogB(@"backlightFadeDuration -> stock %g (%@)", stock, NSStringFromClass([(id)self class]));
             return stock;
@@ -899,7 +950,7 @@ static void startLockPolling(void){
         return v;
     }
     -(double)speedMultiplierForWake{ //Screen turn on speed (might be glitchy)
-        if(deviceLocked){ //lock screen: pure stock, ANY multiplier != 1 flip-flops the pill
+        if(deviceLocked || unlockGraceActive()){ //lock screen: pure stock, ANY multiplier != 1 flip-flops the pill
             double stock = %orig;
             diagLogB(@"speedMultiplierForWake -> stock %g (%@)", stock, NSStringFromClass([(id)self class]));
             return stock;
@@ -920,7 +971,7 @@ static void startLockPolling(void){
         return v;
     }
     -(double)speedMultiplierForLiftToWake{ //Screen turn on speed but for lift to wake (again might be glitchy)
-        if(deviceLocked){ //lock screen: pure stock, ANY multiplier != 1 flip-flops the pill
+        if(deviceLocked || unlockGraceActive()){ //lock screen: pure stock, ANY multiplier != 1 flip-flops the pill
             double stock = %orig;
             diagLogB(@"speedMultiplierForLiftToWake -> stock %g (%@)", stock, NSStringFromClass([(id)self class]));
             return stock;
@@ -965,7 +1016,7 @@ static void startLockPolling(void){
         //auto-hide timer; a shortened delay turns it into an endless show/hide flip-flop
         //(see the lock exemption note above). No app switcher exists while locked, so
         //the stock delay always wins there.
-        if (isOnSpringBoard && deviceLocked){
+        if (isOnSpringBoard && (deviceLocked || unlockGraceActive())){
             double stock = %orig;
             diagLogB(@"dismissDelay while locked -> stock %g (SwitcherDismiss=%g, %@)", stock, SwitcherDismiss, NSStringFromClass([(id)self class]));
             return stock;
@@ -986,13 +1037,20 @@ static void startLockPolling(void){
 //The class is bound at %init time via objc_getClass, same pattern as VolumeControl.
 %group LockScreenTracker
 %hook SBLockScreenManager
+    //Fluid-14 ordering: on LOCK, setDeviceLocked (which runs the stock restore) MUST run
+    //BEFORE %orig - the pill's presentation config reads the fluid settings objects
+    //inside the lock machinery, and it has to see stock values there. On UNLOCK the old
+    //tail-first order is kept so the unlock machinery itself still runs through the
+    //locked (stock) pass-through, and the unlock grace starts right after.
     -(void)_setUILocked:(BOOL)arg1{
+        if(arg1 && !deviceLocked) setDeviceLocked(YES, "_setUILocked(pre)");
         %orig;
-        setDeviceLocked(arg1, "_setUILocked");
+        if(!arg1 && deviceLocked) setDeviceLocked(NO, "_setUILocked");
     }
     -(void)_reallySetUILocked:(BOOL)arg1{
+        if(arg1 && !deviceLocked) setDeviceLocked(YES, "_reallySetUILocked(pre)");
         %orig;
-        setDeviceLocked(arg1, "_reallySetUILocked");
+        if(!arg1 && deviceLocked) setDeviceLocked(NO, "_reallySetUILocked");
     }
 %end
 %end
@@ -1088,7 +1146,7 @@ static void startLockPolling(void){
 		diagLogPath = @"/var/mobile/Library/SpeedsterDiag.log";
 		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring
 		diagBudget = 500; //budget for the pre-first-transition (locked after respring) session
-		diagLog(@"Speedster Fluid-13 loaded, deviceLocked(assumed)=%d", deviceLocked);
+		diagLog(@"Speedster Fluid-14 loaded, deviceLocked(assumed)=%d", deviceLocked);
 		//Build the IMP symbol map in the background so storm traces can be resolved
 		//(takes a few seconds; the boot storm may beat it - later sessions are covered)
 		dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ buildImpSymbolMap(); });
