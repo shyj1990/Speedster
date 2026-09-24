@@ -131,11 +131,6 @@ static double reverseBounceSliderValue(double input){ //track 0.2..1.0 -> dampin
     return 0.9 * pow(0.2222, f);
 }
 
-static double reverseTurnOffSpeed(double input){
-    double total = 0.91;
-    return total - input; //plain fade duration: linear is perceptually fine
-}
-
 static double reverseAppSpeedSliderValue(double input){ //track 0..0.99 -> stock multiplier 1.0..0.1
     double f = input / 0.99;
     f = MIN(MAX(f, 0.0), 1.0);
