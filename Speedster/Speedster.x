@@ -1,6 +1,7 @@
 #import <UIKit/UIKit.h>
 #import <dispatch/dispatch.h>
 #import <objc/runtime.h>
+#import <notify.h>
 static BOOL isOnSpringBoard;
 // -1 means "don't touch the system value". Starting at 0.0 would make
 // emptySwitcherDismissDelay return a 0s delay before setResponse: ever runs,
@@ -272,6 +273,43 @@ static void noteVolumeHUDActivity(void){
     });
 }
 
+//Lock screen exemption ---------------------------------------------------------------
+//Root cause of the "Dynamic Island lock pill flashes forever" bug (device-verified via
+//video frame analysis: constant-amplitude show/hide pulsing at ~2.6Hz, i.e. one cycle
+//every ~0.39s = SwitcherDismiss delay + one collapse spring). The lock indicator pill at
+//the left of the island is presented through the same fluid framework and uses
+//emptySwitcherDismissDelay as its AUTO-HIDE timer: pill shows -> dismissed after 0.1-0.2s
+//-> lock state still wants it visible -> re-presents -> dismissed again... endless
+//flip-flop until Face ID unlock. Stock shows it once (~1s) then hides for good. The pill
+//also has the volume HUD's disease: it reads fluid settings objects configured earlier
+//(stale tweaked values). While the device is locked there is no app switcher at all, so
+//every shortened timing is pure downside: pass everything through stock while locked,
+//and restore stock fluid values on every lock-state change (same cure as the volume HUD).
+static volatile BOOL deviceLocked = YES; //SpringBoard always launches into the lock screen
+static int lockStateNotifyToken = 0;
+
+static void lockCompleteDarwinCallback(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo){
+    deviceLocked = YES; //com.apple.springboard.lockcomplete fires only when locking completes
+    restoreStockValuesForHUD();
+}
+
+static void watchLockState(void){
+    //Primary signal: lockstate carries a payload readable via notify_get_state
+    //(0 = unlocked, non-zero = locked). Even if that payload ever regressed, the
+    //lockcomplete observer above still forces YES on lock (it never fires on unlock).
+    notify_register_dispatch("com.apple.springboard.lockstate", &lockStateNotifyToken,
+                             dispatch_get_main_queue(), ^(int token){
+        uint64_t state = 0;
+        notify_get_state(token, &state);
+        deviceLocked = (state != 0);
+        restoreStockValuesForHUD();
+    });
+    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
+                                    (CFNotificationCallback)lockCompleteDarwinCallback,
+                                    CFSTR("com.apple.springboard.lockcomplete"), NULL,
+                                    CFNotificationSuspensionBehaviorDeliverImmediately);
+}
+
 //App Open animation and bouncing
 %hook SBFFluidBehaviorSettings
     -(void)setResponse:(double)arg1{ //App open and close speed
@@ -284,6 +322,10 @@ static void noteVolumeHUDActivity(void){
             }
         }
         if(volumeHUDActive){ //stock volume HUD: keep untouched, don't disturb switcher state
+            %orig;
+            return;
+        }
+        if(deviceLocked){ //lock-screen island/UI (e.g. lock pill) animations run stock
             %orig;
             return;
         }
@@ -359,6 +401,10 @@ static void noteVolumeHUDActivity(void){
             %orig;
             return;
         }
+        if(deviceLocked){ //lock-screen island/UI (e.g. lock pill) animations run stock
+            %orig;
+            return;
+        }
         if(isBounceEnable){
             if(!isFineTuneBounceEnable){
                 switch (Bouncevalue){
@@ -424,6 +470,10 @@ static void noteVolumeHUDActivity(void){
             %orig;
             return;
         }
+        if(deviceLocked){ //lock-screen animations run stock
+            %orig;
+            return;
+        }
         if(isInstantFolder){
             %orig;
         }else{
@@ -446,6 +496,10 @@ static void noteVolumeHUDActivity(void){
             }
         }
         if(volumeHUDActive){ //stock volume HUD: keep untouched
+            %orig;
+            return;
+        }
+        if(deviceLocked){ //lock-screen animations run stock
             %orig;
             return;
         }
@@ -588,6 +642,13 @@ static void noteVolumeHUDActivity(void){
     }
 
     -(double)emptySwitcherDismissDelay{ //Switcher fix when set speed too high
+        //Lock screen exemption: the island lock indicator pill uses this delay as its
+        //auto-hide timer; a shortened delay turns it into an endless show/hide flip-flop
+        //(see the lock exemption note above). No app switcher exists while locked, so
+        //the stock delay always wins there.
+        if (isOnSpringBoard && deviceLocked){
+            return %orig;
+        }
         //Volume HUD exemption: the HUD's auto-hide timing also flows through this
         //fluid-framework delay, so while the HUD is active the stock delay must win
         //or the HUD starts disappearing almost immediately (2.1.4-1 symptom: the
@@ -685,5 +746,7 @@ static void noteVolumeHUDActivity(void){
 		}];
 
 		%init(VolumeHUDExempt, VolumeControl = objc_getClass("SBVolumeControl"));
+
+		watchLockState(); //lock-state tracking for the lock screen exemption (see note above)
 	}
 }
