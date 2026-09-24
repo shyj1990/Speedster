@@ -355,6 +355,36 @@ static void diagLogB(NSString *fmt, ...){
     va_end(args);
 }
 
+//Fluid-15 unlocked-phase read sampling. While locked every hooked path provably
+//returns stock, yet the pill keeps flashing - so the poison must be a value the
+//pill's controllers captured while UNLOCKED into their own storage (settings-object
+//restore can never reach a private copy). Unlocked-phase calls of the suspects were
+//invisible in every previous log (diagLogB only fires while locked). This samples
+//the first N unlocked reads of each suspect with raw image!offset backtraces.
+//NOTE: backtraces taken from inside our hooks are polluted by every installed
+//tweak's hook trampoline frames (Fluid-14 SymMap analysis proved the "SpringBoard"
+//frames in storm traces are trampolines), but who-calls-whom is still readable.
+static NSInteger unlockTraceBudget = 0;
+static void unlockSampleTrace(NSString *tag, double value){
+    if (!isOnSpringBoard || deviceLocked || unlockTraceBudget <= 0) return;
+    unlockTraceBudget--;
+    void *frames[32] = {0};
+    int n = backtrace(frames, 32);
+    NSMutableString *line = [NSMutableString stringWithFormat:@"[unlock-read] %@ value=%g (%d frames):", tag, value, n];
+    for (int i = 2; i < n && i < 16; i++) {
+        Dl_info info;
+        memset(&info, 0, sizeof(info));
+        NSString *raw = @"?";
+        if (dladdr(frames[i], &info) && info.dli_fname) {
+            const char *base = strrchr(info.dli_fname, '/');
+            raw = [NSString stringWithFormat:@"%s!0x%lx", base ? base + 1 : info.dli_fname,
+                   (unsigned long)((uintptr_t)frames[i] - (uintptr_t)info.dli_fbase)];
+        }
+        [line appendFormat:@" <- %@", raw];
+    }
+    diagLog(@"%@", line);
+}
+
 //Fluid-8 unlocked-phase sampling: one line per (selector, class) pair. The flash loop
 //most likely runs on a value some controller FROZE out of a settings object while the
 //device was unlocked (same disease as the volume HUD's launch-time freeze), so we need
@@ -549,6 +579,7 @@ static void setDeviceLocked(BOOL locked, const char *source){
     deviceLocked = locked;
     if (!locked) unlockTransitionTime = CFAbsoluteTimeGetCurrent();
     diagBudget = 500; //fresh log budget per lock session
+    unlockTraceBudget = 8; //fresh unlocked-read backtrace samples per session
     stormTraceCount = 0; //fresh storm-trace samples per lock session
     //Fluid-14: the lock pill's animation config is read INSIDE %orig of the lock call,
     //i.e. BEFORE this function used to run at the hook's tail - so every lock started
@@ -590,6 +621,37 @@ static void startLockPolling(void){
 
 //App Open animation and bouncing
 %hook SBFFluidBehaviorSettings
+    //Fluid-15 read-side instrumentation: while locked every WRITE is stock, so if the
+    //pill still flashes the poison was READ (and privately frozen) while unlocked.
+    //Sample the first unlocked reads of each value: the [unlock-read] backtraces show
+    //exactly which controller touches a (possibly tweaked) value right before freezing
+    //it. Selectors verified present in the iOS 17 SymMap dump. Perf: class-once logging
+    //and an 8/session trace budget keep the hot getter path cheap.
+    -(double)response{
+        double v = %orig;
+        if(isOnSpringBoard && !deviceLocked){
+            diagLogClassOnce(@"get-response", self, v);
+            unlockSampleTrace(@"get-response", v);
+        }
+        return v;
+    }
+    -(double)dampingRatio{
+        double v = %orig;
+        if(isOnSpringBoard && !deviceLocked){
+            diagLogClassOnce(@"get-dampingRatio", self, v);
+            unlockSampleTrace(@"get-dampingRatio", v);
+        }
+        return v;
+    }
+    -(double)settlingDuration{
+        double v = %orig;
+        if(isOnSpringBoard && !deviceLocked){
+            diagLogClassOnce(@"get-settlingDuration", self, v);
+            unlockSampleTrace(@"get-settlingDuration", v);
+        }
+        return v;
+    }
+
     -(void)setResponse:(double)arg1{ //App open and close speed
         if(restoringForHUD){ %orig; return; }
         if(isOnSpringBoard){
@@ -1012,13 +1074,17 @@ static void startLockPolling(void){
     }
 
     -(double)emptySwitcherDismissDelay{ //Switcher fix when set speed too high
-        //Lock screen exemption: the island lock indicator pill uses this delay as its
-        //auto-hide timer; a shortened delay turns it into an endless show/hide flip-flop
-        //(see the lock exemption note above). No app switcher exists while locked, so
-        //the stock delay always wins there.
-        if (isOnSpringBoard && (deviceLocked || unlockGraceActive())){
+        //Fluid-15: ALWAYS stock on SpringBoard. This getter used to hand out
+        //SwitcherDismiss (0.1-0.2s, tracks the app open/close slider) during the whole
+        //unlocked phase, and unlocked-phase calls were never logged - a controller that
+        //caches it (island/lock-pill auto-hide timing) would replay the short delay as
+        //the endless lock-pill flip-flop, with a frequency that tracks the slider.
+        //Everything else is provably stock while locked (Fluid-14 log), so this is the
+        //prime remaining suspect. Temporarily disables the switcher auto-dismiss timing.
+        if (isOnSpringBoard){
             double stock = %orig;
-            diagLogB(@"dismissDelay while locked -> stock %g (SwitcherDismiss=%g, %@)", stock, SwitcherDismiss, NSStringFromClass([(id)self class]));
+            diagLogClassOnce(@"emptySwitcherDismissDelay", self, stock);
+            unlockSampleTrace(@"emptySwitcherDismissDelay", stock);
             return stock;
         }
         //Volume HUD exemption: the HUD's auto-hide timing also flows through this
@@ -1146,7 +1212,7 @@ static void startLockPolling(void){
 		diagLogPath = @"/var/mobile/Library/SpeedsterDiag.log";
 		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring
 		diagBudget = 500; //budget for the pre-first-transition (locked after respring) session
-		diagLog(@"Speedster Fluid-14 loaded, deviceLocked(assumed)=%d", deviceLocked);
+		diagLog(@"Speedster Fluid-15 loaded, deviceLocked(assumed)=%d", deviceLocked);
 		//Build the IMP symbol map in the background so storm traces can be resolved
 		//(takes a few seconds; the boot storm may beat it - later sessions are covered)
 		dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ buildImpSymbolMap(); });
