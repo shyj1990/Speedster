@@ -410,7 +410,7 @@ static void buildImpSymbolMap(void){
         if (classes) free(classes);
         NSMutableArray *pairs = [NSMutableArray arrayWithCapacity:imps.count];
         for (NSUInteger i = 0; i < imps.count; i++) {
-            [pairs addObject:@[@[imps[i], names[i]]]];
+            [pairs addObject:@[imps[i], names[i]]]; //2-element pair, NOT nested in an extra array
         }
         [pairs sortUsingComparator:^NSComparisonResult(NSArray *a, NSArray *b){
             return [a[0] compare:b[0]];
@@ -1019,7 +1019,7 @@ static void startLockPolling(void){
 		diagLogPath = @"/var/mobile/Library/SpeedsterDiag.log";
 		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring
 		diagBudget = 500; //budget for the pre-first-transition (locked after respring) session
-		diagLog(@"Speedster Fluid-10 loaded, deviceLocked(assumed)=%d", deviceLocked);
+		diagLog(@"Speedster Fluid-11 loaded, deviceLocked(assumed)=%d", deviceLocked);
 		//Build the IMP symbol map in the background so storm traces can be resolved
 		//(takes a few seconds; the boot storm may beat it - later sessions are covered)
 		dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ buildImpSymbolMap(); });
