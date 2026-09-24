@@ -424,7 +424,67 @@ static void buildImpSymbolMap(void){
         traceSortedImps = sortedI;
         traceSortedNames = sortedN;
         diagLog(@"imp symbol map built: %lu methods", (unsigned long)sortedI.count);
+        if (sortedI.count) {
+            diagLog(@"imp map range: min=%@ max=%@", sortedI.firstObject, sortedI.lastObject);
+        }
         traceMapReady = YES;
+        //Self-test: the map must resolve a known shared-cache method imp back to itself.
+        //Fluid-11 resolved every SpringBoard frame to one wrong method, so either the map
+        //misses SpringBoard's own methods or frames and imps live in different ranges.
+        Class fbs = objc_getClass("SBFFluidBehaviorSettings");
+        if (fbs) {
+            Method m = class_getInstanceMethod(fbs, @selector(setResponse:));
+            if (m) {
+                void *imp = (void *)method_getImplementation(m);
+                diagLog(@"map self-test: setResponse imp=%p -> %@", imp, symbolForAddr(imp) ?: @"UNRESOLVED");
+            }
+        }
+        dumpSymbolMapFile();
+    }
+}
+
+//One-shot dump of every ObjC method of the images seen in storm traces (SpringBoard,
+//SpringBoardFoundation, PrototypeTools). The file lets the developer resolve raw frame
+//addresses on the PC precisely, independent of the on-device map's health.
+static void dumpSymbolMapFile(void){
+    @autoreleasepool {
+        NSString *path = @"/var/mobile/Library/SpeedsterSymMap.txt";
+        FILE *f = fopen(path.fileSystemRepresentation, "w");
+        if (!f) { diagLog(@"sym dump: cannot open %@", path); return; }
+        unsigned int count = 0;
+        Class *classes = objc_copyClassList(&count);
+        unsigned long dumped = 0;
+        for (unsigned int i = 0; i < count; i++) {
+            @autoreleasepool {
+                unsigned int mCount = 0;
+                Method *methods = class_copyMethodList(classes[i], &mCount);
+                if (!methods || !mCount) { if (methods) free(methods); continue; }
+                Dl_info info;
+                memset(&info, 0, sizeof(info));
+                BOOL haveImage = dladdr((void *)method_getImplementation(methods[0]), &info) && info.dli_fname;
+                BOOL keep = NO;
+                if (haveImage) {
+                    const char *img = info.dli_fname;
+                    size_t len = strlen(img);
+                    keep = (len >= 12 && !strcmp(img + len - 12, "/SpringBoard"))
+                        || strstr(img, "SpringBoardFoundation") != NULL
+                        || strstr(img, "PrototypeTools") != NULL;
+                }
+                if (keep) {
+                    for (unsigned int j = 0; j < mCount; j++) {
+                        fprintf(f, "0x%lx %s %s\n",
+                                (unsigned long)method_getImplementation(methods[j]),
+                                class_getName(classes[i]),
+                                sel_getName(method_getName(methods[j])));
+                        dumped++;
+                    }
+                }
+                free(methods);
+            }
+        }
+        if (classes) free(classes);
+        fclose(f);
+        diagLog(@"sym dump written: %lu methods -> %@", dumped, path);
     }
 }
 
@@ -446,18 +506,22 @@ static void logStormTrace(void){
     int n = backtrace(frames, 32);
     NSMutableString *line = [NSMutableString stringWithFormat:@"storm trace (call #%ld, %d frames):", (long)stormTraceCount, n];
     for (int i = 2; i < n && i < 18; i++) { //skip our own hook + orig thunk frames
+        //Always log the raw image!offset - the on-device name resolution proved
+        //unreliable (Fluid-11), and raw offsets are resolvable on the PC from the
+        //SpeedsterSymMap.txt dump.
+        NSString *raw = @"?";
+        Dl_info info;
+        memset(&info, 0, sizeof(info));
+        if (dladdr(frames[i], &info) && info.dli_fname) {
+            const char *base = strrchr(info.dli_fname, '/');
+            raw = [NSString stringWithFormat:@"%s!0x%lx", base ? base + 1 : info.dli_fname,
+                   (unsigned long)((uintptr_t)frames[i] - (uintptr_t)info.dli_fbase)];
+        }
         NSString *sym = symbolForAddr(frames[i]);
         if (sym) {
-            [line appendFormat:@" <- %@", sym];
+            [line appendFormat:@" <- %@{%@}", sym, raw];
         } else {
-            Dl_info info;
-            if (dladdr(frames[i], &info) && info.dli_fname) {
-                const char *base = strrchr(info.dli_fname, '/');
-                [line appendFormat:@" <- %s!%p", base ? base + 1 : info.dli_fname,
-                    (void *)((uintptr_t)frames[i] - (uintptr_t)info.dli_fbase)];
-            } else {
-                [line appendFormat:@" <- %p", frames[i]];
-            }
+            [line appendFormat:@" <- %@", raw];
         }
     }
     diagLog(@"%@", line);
@@ -1019,7 +1083,7 @@ static void startLockPolling(void){
 		diagLogPath = @"/var/mobile/Library/SpeedsterDiag.log";
 		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring
 		diagBudget = 500; //budget for the pre-first-transition (locked after respring) session
-		diagLog(@"Speedster Fluid-11 loaded, deviceLocked(assumed)=%d", deviceLocked);
+		diagLog(@"Speedster Fluid-12 loaded, deviceLocked(assumed)=%d", deviceLocked);
 		//Build the IMP symbol map in the background so storm traces can be resolved
 		//(takes a few seconds; the boot storm may beat it - later sessions are covered)
 		dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ buildImpSymbolMap(); });
