@@ -215,19 +215,6 @@ static BOOL bootGraceActive(void){
     return YES;
 }
 
-//Fluid-14 unlock grace: for a short window right after the unlock transition completes,
-//keep every SpringBoard-facing hook at stock. The lock pill collapses during the unlock
-//transition and may (re)configure its presentation settings just after the state flips;
-//any tweaked value it picks up there gets frozen into its own state and replays as the
-//endless silent flash on the next lock. Cost: app animations in the first 0.6s after
-//unlock run at stock speed (barely noticeable, the unlock flow lands on the home screen).
-static CFAbsoluteTime unlockTransitionTime = 0;
-static BOOL unlockGraceActive(void){
-    if (!isOnSpringBoard || deviceLocked) return NO;
-    if (unlockTransitionTime == 0) return NO;
-    return (CFAbsoluteTimeGetCurrent() - unlockTransitionTime) < 0.6;
-}
-
 //Silence the compiler for restore calls: the hooked setters exist at runtime on the
 //recorded objects, but the compiler only knows them from the %hook context.
 @interface NSObject (SpeedsterFluidSettings)
@@ -323,6 +310,19 @@ static volatile BOOL deviceLocked = YES; //SpringBoard always launches into the 
 static dispatch_source_t lockPollTimer;
 static NSString *diagLogPath = nil;
 static NSInteger diagBudget = 0;
+
+//Fluid-14 unlock grace: for a short window right after the unlock transition completes,
+//keep every SpringBoard-facing hook at stock. The lock pill collapses during the unlock
+//transition and may (re)configure its presentation settings just after the state flips;
+//any tweaked value it picks up there gets frozen into its own state and replays as the
+//endless silent flash on the next lock. Cost: app animations in the first 0.6s after
+//unlock run at stock speed (barely noticeable, the unlock flow lands on the home screen).
+static CFAbsoluteTime unlockTransitionTime = 0;
+static BOOL unlockGraceActive(void){
+    if (!isOnSpringBoard || deviceLocked) return NO;
+    if (unlockTransitionTime == 0) return NO;
+    return (CFAbsoluteTimeGetCurrent() - unlockTransitionTime) < 0.6;
+}
 
 static void diagLogCore(NSString *fmt, va_list args){
     if (!diagLogPath) return;
