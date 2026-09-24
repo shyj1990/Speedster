@@ -1,7 +1,9 @@
 #import <UIKit/UIKit.h>
 #import <dispatch/dispatch.h>
 #import <objc/runtime.h>
-#import <notify.h>
+#import <objc/message.h>
+#import <stdio.h>
+#import <stdarg.h>
 static BOOL isOnSpringBoard;
 // -1 means "don't touch the system value". Starting at 0.0 would make
 // emptySwitcherDismissDelay return a 0s delay before setResponse: ever runs,
@@ -274,40 +276,88 @@ static void noteVolumeHUDActivity(void){
 }
 
 //Lock screen exemption ---------------------------------------------------------------
-//Root cause of the "Dynamic Island lock pill flashes forever" bug (device-verified via
-//video frame analysis: constant-amplitude show/hide pulsing at ~2.6Hz, i.e. one cycle
-//every ~0.39s = SwitcherDismiss delay + one collapse spring). The lock indicator pill at
-//the left of the island is presented through the same fluid framework and uses
-//emptySwitcherDismissDelay as its AUTO-HIDE timer: pill shows -> dismissed after 0.1-0.2s
-//-> lock state still wants it visible -> re-presents -> dismissed again... endless
-//flip-flop until Face ID unlock. Stock shows it once (~1s) then hides for good. The pill
-//also has the volume HUD's disease: it reads fluid settings objects configured earlier
-//(stale tweaked values). While the device is locked there is no app switcher at all, so
-//every shortened timing is pure downside: pass everything through stock while locked,
-//and restore stock fluid values on every lock-state change (same cure as the volume HUD).
+//v2.1.4-Fluid-6 failed on device: the lock pill kept flashing and its frequency tracked
+//the app open/close slider, i.e. the exemptions never engaged. Both legacy lock signals
+//are dead on iOS 17: "com.apple.springboard.lockcomplete" doesn't fire and the lockstate
+//notify payload reads 0 in both directions, so deviceLocked stayed NO and every exemption
+//branch was skipped (behavior identical to Fluid-5).
+//v2.1.4-Fluid-7 reads lock state from the class that OWNS it (verified against the iOS 17
+//SpringBoard runtime dump): SBLockScreenManager.sharedInstance.isUILocked, via three
+//redundant channels - (1) direct hooks on _setUILocked:/_reallySetUILocked: (instant),
+//(2) a 0.5s authoritative poll (converges even if hooks/notifications ever fail), and
+//(3) the lockcomplete darwin notification as a bonus. On change we also run the
+//volume-HUD-style stock restore so the lock pill reads clean fluid settings objects.
+//Diag logging (this build only): /var/mobile/Library/SpeedsterDiag.log, fresh per
+//respring, budgeted while locked so it can never spam per-frame.
 static volatile BOOL deviceLocked = YES; //SpringBoard always launches into the lock screen
-static int lockStateNotifyToken = 0;
+static dispatch_source_t lockPollTimer;
+static NSString *diagLogPath = nil;
+static NSInteger diagBudget = 0;
 
-static void lockCompleteDarwinCallback(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo){
-    deviceLocked = YES; //com.apple.springboard.lockcomplete fires only when locking completes
+static void diagLogCore(NSString *fmt, va_list args){
+    if (!diagLogPath) return;
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
+    NSString *line = [NSString stringWithFormat:@"[%.3f] %@\n",
+                      [NSDate date].timeIntervalSince1970, msg];
+    FILE *f = fopen(diagLogPath.fileSystemRepresentation, "a");
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        if (ftell(f) > 512 * 1024) { fclose(f); f = fopen(diagLogPath.fileSystemRepresentation, "w"); }
+        if (f) { fputs(line.UTF8String, f); fclose(f); }
+    }
+}
+
+static void diagLog(NSString *fmt, ...){
+    va_list args; va_start(args, fmt);
+    diagLogCore(fmt, args);
+    va_end(args);
+}
+
+//Budgeted variant for potentially chatty call sites (40 lines per lock session max)
+static void diagLogB(NSString *fmt, ...){
+    if (diagBudget <= 0) return;
+    diagBudget--;
+    va_list args; va_start(args, fmt);
+    diagLogCore(fmt, args);
+    va_end(args);
+}
+
+static BOOL queryUILocked(void){
+    Class cls = objc_getClass("SBLockScreenManager");
+    if (!cls) return NO;
+    id mgr = ((id(*)(Class, SEL))objc_msgSend)(cls, @selector(sharedInstance));
+    if (!mgr) return NO;
+    return !!((BOOL(*)(id, SEL))objc_msgSend)(mgr, @selector(isUILocked));
+}
+
+static void setDeviceLocked(BOOL locked, const char *source){
+    if (locked == deviceLocked) return;
+    diagLog(@"deviceLocked %d -> %d (%s)", deviceLocked, locked, source);
+    deviceLocked = locked;
+    diagBudget = 40; //fresh log budget per lock session
     restoreStockValuesForHUD();
 }
 
+static void lockCompleteDarwinCallback(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo){
+    setDeviceLocked(YES, "lockcomplete");
+}
+
 static void watchLockState(void){
-    //Primary signal: lockstate carries a payload readable via notify_get_state
-    //(0 = unlocked, non-zero = locked). Even if that payload ever regressed, the
-    //lockcomplete observer above still forces YES on lock (it never fires on unlock).
-    notify_register_dispatch("com.apple.springboard.lockstate", &lockStateNotifyToken,
-                             dispatch_get_main_queue(), ^(int token){
-        uint64_t state = 0;
-        notify_get_state(token, &state);
-        deviceLocked = (state != 0);
-        restoreStockValuesForHUD();
-    });
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
                                     (CFNotificationCallback)lockCompleteDarwinCallback,
                                     CFSTR("com.apple.springboard.lockcomplete"), NULL,
                                     CFNotificationSuspensionBehaviorDeliverImmediately);
+}
+
+static void startLockPolling(void){
+    lockPollTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    dispatch_source_set_timer(lockPollTimer,
+                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                              (int64_t)(0.5 * NSEC_PER_SEC), 0);
+    dispatch_source_set_event_handler(lockPollTimer, ^{
+        setDeviceLocked(queryUILocked(), "poll");
+    });
+    dispatch_resume(lockPollTimer);
 }
 
 //App Open animation and bouncing
@@ -326,6 +376,7 @@ static void watchLockState(void){
             return;
         }
         if(deviceLocked){ //lock-screen island/UI (e.g. lock pill) animations run stock
+            diagLogB(@"setResponse %g while locked (self=%p)", arg1, self);
             %orig;
             return;
         }
@@ -402,6 +453,7 @@ static void watchLockState(void){
             return;
         }
         if(deviceLocked){ //lock-screen island/UI (e.g. lock pill) animations run stock
+            diagLogB(@"setDampingRatio %g while locked (self=%p)", arg1, self);
             %orig;
             return;
         }
@@ -471,6 +523,7 @@ static void watchLockState(void){
             return;
         }
         if(deviceLocked){ //lock-screen animations run stock
+            diagLogB(@"SBFAnimationSettings setDamping %g while locked (self=%p)", arg1, self);
             %orig;
             return;
         }
@@ -500,6 +553,7 @@ static void watchLockState(void){
             return;
         }
         if(deviceLocked){ //lock-screen animations run stock
+            diagLogB(@"SBFAnimationSettings setMass %g while locked (self=%p)", arg1, self);
             %orig;
             return;
         }
@@ -647,7 +701,9 @@ static void watchLockState(void){
         //(see the lock exemption note above). No app switcher exists while locked, so
         //the stock delay always wins there.
         if (isOnSpringBoard && deviceLocked){
-            return %orig;
+            double stock = %orig;
+            diagLogB(@"dismissDelay while locked -> stock %g (SwitcherDismiss=%g)", stock, SwitcherDismiss);
+            return stock;
         }
         //Volume HUD exemption: the HUD's auto-hide timing also flows through this
         //fluid-framework delay, so while the HUD is active the stock delay must win
@@ -658,6 +714,22 @@ static void watchLockState(void){
         }
         return SwitcherDismiss;
     }
+%end
+
+//Authoritative lock-state transitions from the class that owns them (iOS 17 selectors
+//verified against the runtime dump; Logos silently skips wherever they don't exist).
+//The class is bound at %init time via objc_getClass, same pattern as VolumeControl.
+%group LockScreenTracker
+%hook SBLockScreenManager
+    -(void)_setUILocked:(BOOL)arg1{
+        %orig;
+        setDeviceLocked(arg1, "_setUILocked");
+    }
+    -(void)_reallySetUILocked:(BOOL)arg1{
+        %orig;
+        setDeviceLocked(arg1, "_reallySetUILocked");
+    }
+%end
 %end
 
 %hook CSCoverSheetTransitionSettings
@@ -747,6 +819,19 @@ static void watchLockState(void){
 
 		%init(VolumeHUDExempt, VolumeControl = objc_getClass("SBVolumeControl"));
 
-		watchLockState(); //lock-state tracking for the lock screen exemption (see note above)
+		//Lock screen exemption wiring (see the lock exemption note above)
+		diagLogPath = @"/var/mobile/Library/SpeedsterDiag.log";
+		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring
+		diagBudget = 60; //budget for the pre-first-transition (locked after respring) session
+		diagLog(@"Speedster Fluid-7 loaded, deviceLocked(assumed)=%d", deviceLocked);
+		Class lockMgrClass = objc_getClass("SBLockScreenManager");
+		if (lockMgrClass) {
+			%init(LockScreenTracker, SBLockScreenManager = lockMgrClass);
+			diagLog(@"SBLockScreenTracker hooks initialized");
+		} else {
+			diagLog(@"SBLockScreenManager class NOT found!");
+		}
+		watchLockState();
+		startLockPolling();
 	}
 }
