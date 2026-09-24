@@ -992,66 +992,41 @@ static void startLockPolling(void){
 //speed feature keeps working while UNLOCKED (where no lock pill exists anyway).
 //This unavoidably disables 亮屏加速 on the lock screen - iOS 17 hard conflict.
 %hook SBFWakeAnimationSettings
+    //Fluid-16 FINAL: all three getters return stock ALWAYS. The Fluid-15 log caught the
+    //smoking gun: ~1.3s before EVERY lock (lock button -> backlight fade prep), while the
+    //lock flag still says "unlocked", the system reads backlightFadeDuration and got the
+    //tweaked+clamped 0.15 (stock 0.185) - a non-stock WAKE-FAMILY value inside the lock
+    //transition, the exact disease Fluid-13 proved fatal to the pill state machine (any
+    //multiplier != 1 in this family flip-flops the pill). Waking only ever happens from
+    //the locked/off state and sleeping only ever happens into it, so unlocked-phase
+    //reads of these getters are always transition-gap reads; the user-facing features
+    //were imperceptible anyway (clamped 0.15 vs 0.185 stock = 19% at the fastest slider).
     -(double)backlightFadeDuration{ //Screen turn off speed
-        if(deviceLocked || unlockGraceActive()){ //lock screen: pure stock, the pill state machine is sensitive
-            double stock = %orig;
+        double stock = %orig;
+        if(deviceLocked || unlockGraceActive()){
             diagLogB(@"backlightFadeDuration -> stock %g (%@)", stock, NSStringFromClass([(id)self class]));
-            return stock;
-        }
-        double v;
-        if(isScreensleepEnable){
-            v = reverseTurnOffSpeed(Screensleepvalue);
         }else{
-            v = %orig;
+            diagLogClassOnce(@"backlightFadeDuration", self, stock);
         }
-        if(v < 0.15){
-            diagLog(@"clamped backlightFadeDuration %g -> 0.15", v);
-            v = 0.15;
-        }
-        diagLogClassOnce(@"backlightFadeDuration", self, v);
-        return v;
+        return stock;
     }
     -(double)speedMultiplierForWake{ //Screen turn on speed (might be glitchy)
-        if(deviceLocked || unlockGraceActive()){ //lock screen: pure stock, ANY multiplier != 1 flip-flops the pill
-            double stock = %orig;
+        double stock = %orig;
+        if(deviceLocked || unlockGraceActive()){
             diagLogB(@"speedMultiplierForWake -> stock %g (%@)", stock, NSStringFromClass([(id)self class]));
-            return stock;
-        }
-        double v;
-        if(isScreenwakeEnable){
-            v = Screenwakevalue;
         }else{
-            v = %orig;
+            diagLogClassOnce(@"speedMultiplierForWake", self, stock);
         }
-        if(v > 3.0){
-            diagLog(@"clamped speedMultiplierForWake %g -> 3", v);
-            v = 3.0;
-        }else if(v < 1.0){
-            v = 1.0;
-        }
-        diagLogClassOnce(@"speedMultiplierForWake", self, v);
-        return v;
+        return stock;
     }
     -(double)speedMultiplierForLiftToWake{ //Screen turn on speed but for lift to wake (again might be glitchy)
-        if(deviceLocked || unlockGraceActive()){ //lock screen: pure stock, ANY multiplier != 1 flip-flops the pill
-            double stock = %orig;
+        double stock = %orig;
+        if(deviceLocked || unlockGraceActive()){
             diagLogB(@"speedMultiplierForLiftToWake -> stock %g (%@)", stock, NSStringFromClass([(id)self class]));
-            return stock;
-        }
-        double v;
-        if(isScreenwakeEnable){
-            v = Screenwakevalue;
         }else{
-            v = %orig;
+            diagLogClassOnce(@"speedMultiplierForLiftToWake", self, stock);
         }
-        if(v > 3.0){
-            diagLog(@"clamped speedMultiplierForLiftToWake %g -> 3", v);
-            v = 3.0;
-        }else if(v < 1.0){
-            v = 1.0;
-        }
-        diagLogClassOnce(@"speedMultiplierForLiftToWake", self, v);
-        return v;
+        return stock;
     }
 %end
 
@@ -1074,17 +1049,12 @@ static void startLockPolling(void){
     }
 
     -(double)emptySwitcherDismissDelay{ //Switcher fix when set speed too high
-        //Fluid-15: ALWAYS stock on SpringBoard. This getter used to hand out
-        //SwitcherDismiss (0.1-0.2s, tracks the app open/close slider) during the whole
-        //unlocked phase, and unlocked-phase calls were never logged - a controller that
-        //caches it (island/lock-pill auto-hide timing) would replay the short delay as
-        //the endless lock-pill flip-flop, with a frequency that tracks the slider.
-        //Everything else is provably stock while locked (Fluid-14 log), so this is the
-        //prime remaining suspect. Temporarily disables the switcher auto-dismiss timing.
-        if (isOnSpringBoard){
+        //Fluid-15 verdict: ZERO calls in an entire session (locked AND unlocked) - the
+        //getter is fully exonerated as the pill poison, so the switcher auto-dismiss
+        //timing feature returns (Fluid-14 behavior below).
+        if (isOnSpringBoard && (deviceLocked || unlockGraceActive())){
             double stock = %orig;
-            diagLogClassOnce(@"emptySwitcherDismissDelay", self, stock);
-            unlockSampleTrace(@"emptySwitcherDismissDelay", stock);
+            diagLogB(@"dismissDelay while locked -> stock %g (SwitcherDismiss=%g, %@)", stock, SwitcherDismiss, NSStringFromClass([(id)self class]));
             return stock;
         }
         //Volume HUD exemption: the HUD's auto-hide timing also flows through this
@@ -1212,7 +1182,7 @@ static void startLockPolling(void){
 		diagLogPath = @"/var/mobile/Library/SpeedsterDiag.log";
 		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring
 		diagBudget = 500; //budget for the pre-first-transition (locked after respring) session
-		diagLog(@"Speedster Fluid-15 loaded, deviceLocked(assumed)=%d", deviceLocked);
+		diagLog(@"Speedster Fluid-16 loaded, deviceLocked(assumed)=%d", deviceLocked);
 		//Build the IMP symbol map in the background so storm traces can be resolved
 		//(takes a few seconds; the boot storm may beat it - later sessions are covered)
 		dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ buildImpSymbolMap(); });
