@@ -12,9 +12,6 @@ static BOOL isOnSpringBoard;
 // causing the switcher animation to be recomputed constantly (high CPU on iOS 17).
 static double SwitcherDismiss = -1;
 
-// static Class CASpringAnimationClass = Nil;
-// static Class SBFAnimationSettingsClass = Nil;
-
 static BOOL isSpeedEnable;
 static BOOL isBounceEnable;
 static int Speedvalue;
@@ -26,20 +23,13 @@ static double FineTuneBounceValue;
 
 static BOOL isFolderAnimationEnabled;
 static BOOL isFolderAnimationBounceEnabled;
-// static double FolderInitialVelocityValue;
-// static double FolderSpeedValue;
-// static double FolderStiffnessValue;
 static double FolderMassValue;
 static double FolderDampingValue;
 
 static BOOL inAppAnimationEnabled;
 static BOOL inAppAnimationBounceEnabled;
-// static double InitialVelocityValue;
-// static double VelocityValue;
-// static double StiffnessValue;
 static double MassValue;
 static double DampingValue;
-static double DurationValue;
 
 static BOOL isNoiconflyEnable;
 static BOOL isNoiconshakingEnable;
@@ -63,12 +53,9 @@ void preferencesthings(){ //pref starts to look THICC
     //folder values
     isFolderAnimationEnabled = (prefs && [prefs objectForKey:@"isFolderAnimationEnabled"] ? [[prefs valueForKey:@"isFolderAnimationEnabled"] boolValue] : NO );
     isFolderAnimationBounceEnabled = (prefs && [prefs objectForKey:@"isFolderBounceEnabled"] ? [[prefs valueForKey:@"isFolderBounceEnabled"] boolValue] : NO );
-    // FolderInitialVelocityValue
-    // FolderSpeedValue = (prefs && [prefs objectForKey:@"FolderVelocityValue"] ? [[prefs valueForKey:@"FolderVelocityValue"] doubleValue] : 1 );
     FolderDampingValue = (prefs && [prefs objectForKey:@"FolderDampingValue"] ? [[prefs valueForKey:@"FolderDampingValue"] doubleValue] : 0 );
     FolderMassValue = (prefs && [prefs objectForKey:@"FolderMassValue"] ? [[prefs valueForKey:@"FolderMassValue"] doubleValue] : 0 );
-    // FolderStiffnessValue = (prefs && [prefs objectForKey:@"FolderStiffnessValue"] ? [[prefs valueForKey:@"FolderStiffnessValue"] doubleValue] : 1 );
-    
+
     //extra
     isNoiconflyEnable = (prefs && [prefs objectForKey:@"nofly"] ? [[prefs valueForKey:@"nofly"] boolValue] : NO );
     isNoiconZoominSwitcher = (prefs && [prefs objectForKey:@"nozoom"] ? [[prefs valueForKey:@"nozoom"] boolValue] : NO );
@@ -83,12 +70,8 @@ void inAppSpeedPreferences(){
     //in-app values
     inAppAnimationEnabled = (prefs && [prefs objectForKey:@"InAppAnimationEnabled"] ? [[prefs valueForKey:@"InAppAnimationEnabled"] boolValue] : NO );
     inAppAnimationBounceEnabled = (prefs && [prefs objectForKey:@"isInAppBounceEnabled"] ? [[prefs valueForKey:@"isInAppBounceEnabled"] boolValue] : NO );
-    // InitialVelocityValue
-    // VelocityValue = (prefs && [prefs objectForKey:@"VelocityValue"] ? [[prefs valueForKey:@"VelocityValue"] doubleValue] : 1 );
     DampingValue = (prefs && [prefs objectForKey:@"DampingValue"] ? [[prefs valueForKey:@"DampingValue"] doubleValue] : 0 );
     MassValue = (prefs && [prefs objectForKey:@"DurationMassValue"] ? [[prefs valueForKey:@"DurationMassValue"] doubleValue] : 0 );
-    // StiffnessValue = (prefs && [prefs objectForKey:@"StiffnessValue"] ? [[prefs valueForKey:@"StiffnessValue"] doubleValue] : 1 );
-    DurationValue = (prefs && [prefs objectForKey:@"DurationMassValue"] ? [[prefs valueForKey:@"DurationMassValue"] doubleValue] : 0 );
 }
 
 static void preferencesChanged(){ //runs at load and every time the prefs darwin notification fires
@@ -627,23 +610,6 @@ static void startLockPolling(void){
 //Springboard speed (mostly for folder but might affect something else on springboard too)
 %hook SBFAnimationSettings
 
-    //folder starting speed
-    // -(void)setInitialVelocity:(double)arg1{
-    //     %orig;
-    // }
-
-    // -(void)setSpeed:(double)arg1{
-    //     if(isInstantFolder){
-    //         %orig(arg1);        
-    //     }else{
-    //         if (isFolderAnimationEnabled){
-    //             %orig(arg1*FolderSpeedValue);
-    //         }else{
-    //             %orig;
-    //         }
-    //     }
-    // }
-
     -(void)setDamping:(double)arg1{
         if(restoringForHUD){ %orig; return; }
         if(isOnSpringBoard){
@@ -713,44 +679,10 @@ static void startLockPolling(void){
         }
     }
 
-    // -(void)setStiffness:(double)arg1{
-    //     if(isInstantFolder){
-    //         %orig;
-    //     }else{
-    //         if(isFolderAnimationEnabled){
-    //             %orig(arg1*FolderStiffnessValue);
-    //         }else{
-    //             %orig;
-    //         }
-    //     }
-    // }
-
 %end
 
 //In-App animation
 %hook CASpringAnimation
-
-    //start speed
-    // -(void)setInitialVelocity:(double)arg1{
-    //     %orig;
-    // }
-
-    //speed
-    // - (void)setVelocity:(double)arg1{
-    //     if(inAppAnimationEnabled){
-    //         %orig(arg1 * VelocityValue);
-    //     }else{
-    //         %orig(arg1);
-    //     }
-    // }
-
-    // -(void)setStiffness:(double)arg1{
-    //     if(inAppAnimationEnabled){
-    //         %orig(arg1 * StiffnessValue);
-    //     }else{
-    //         %orig(arg1);
-    //     }
-    // }
 
     //mass
     -(void)setMass:(double)arg1{ //in app speed
@@ -769,33 +701,7 @@ static void startLockPolling(void){
         }
     }
 
-    // - (void)setDuration:(double)arg1{
-    //     if(inAppAnimationEnabled && !isOnSpringBoard){
-    //         %orig(arg1 * 0.5);
-    //     }else{
-    //         %orig(arg1);
-    //     }
-    // }
-
 %end
-
-//In-App animation 2: electric boogaloo
-// %hook CAAnimation
-
-//     //duration
-//    - (void)setDuration:(double)arg1{ //more in app speed but with more side effect 
-//         if ([self isKindOfClass:[CASpringAnimationClass class]]) { //thanks fakeclockup
-//             %orig(arg1);
-//             return;
-//         }
-//         if(inAppAnimationEnabled){
-//             %orig(arg1 * reverseAppSpeedSliderValue(DurationValue));
-//         }else{
-//             %orig;
-//         }
-//     }
-    
-// %end
 
 //Screen Turn On and Off Speed
 //Fluid-13 FINAL root cause: while the device is locked, ANY non-stock wake animation
@@ -979,9 +885,6 @@ static void startLockPolling(void){
 
 %ctor { //More pref
     tweakLoadTime = CFAbsoluteTimeGetCurrent(); //start of the 15s boot grace window (see note above)
-    // NSLog(@"[Speedster] load test");
-    // CASpringAnimationClass = NSClassFromString(@"CASpringAnimation");
-    // SBFAnimationSettingsClass = NSClassFromString(@"SBFAnimationSettings");
     isOnSpringBoard = [[[NSBundle mainBundle] bundleIdentifier] isEqual:@"com.apple.springboard"];
 
     %init(_ungrouped); //activate all hooks outside explicit %groups
