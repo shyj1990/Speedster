@@ -424,7 +424,7 @@ static void startLockPolling(void){
             return;
         }
         if(deviceLocked){ //lock-screen island/UI (e.g. lock pill) animations run stock
-            diagLogB(@"setResponse %g while locked (%@ self=%p)", arg1, NSStringFromClass([self class]), self);
+            diagLogB(@"setResponse %g while locked (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self);
             %orig;
             return;
         }
@@ -502,7 +502,7 @@ static void startLockPolling(void){
             return;
         }
         if(deviceLocked){ //lock-screen island/UI (e.g. lock pill) animations run stock
-            diagLogB(@"setDampingRatio %g while locked (%@ self=%p)", arg1, NSStringFromClass([self class]), self);
+            diagLogB(@"setDampingRatio %g while locked (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self);
             %orig;
             return;
         }
@@ -573,7 +573,7 @@ static void startLockPolling(void){
             return;
         }
         if(deviceLocked){ //lock-screen animations run stock
-            diagLogB(@"SBFAnimationSettings setDamping %g while locked (%@ self=%p)", arg1, NSStringFromClass([self class]), self);
+            diagLogB(@"SBFAnimationSettings setDamping %g while locked (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self);
             %orig;
             return;
         }
@@ -604,7 +604,7 @@ static void startLockPolling(void){
             return;
         }
         if(deviceLocked){ //lock-screen animations run stock
-            diagLogB(@"SBFAnimationSettings setMass %g while locked (%@ self=%p)", arg1, NSStringFromClass([self class]), self);
+            diagLogB(@"SBFAnimationSettings setMass %g while locked (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self);
             %orig;
             return;
         }
@@ -715,7 +715,7 @@ static void startLockPolling(void){
         //Fluid-8: these three getters are the ONLY values still tweaked while locked -
         //log every locked-phase read (budgeted) to prove whether the flash loop reads them.
         if(deviceLocked){
-            diagLogB(@"backlightFadeDuration -> %g (%@)", v, NSStringFromClass([self class]));
+            diagLogB(@"backlightFadeDuration -> %g (%@)", v, NSStringFromClass([(id)self class]));
         }else{
             diagLogClassOnce(@"backlightFadeDuration", self, v);
         }
@@ -729,7 +729,7 @@ static void startLockPolling(void){
             v = %orig;
         }
         if(deviceLocked){
-            diagLogB(@"speedMultiplierForWake -> %g (%@)", v, NSStringFromClass([self class]));
+            diagLogB(@"speedMultiplierForWake -> %g (%@)", v, NSStringFromClass([(id)self class]));
         }else{
             diagLogClassOnce(@"speedMultiplierForWake", self, v);
         }
@@ -743,7 +743,7 @@ static void startLockPolling(void){
             v = %orig;
         }
         if(deviceLocked){
-            diagLogB(@"speedMultiplierForLiftToWake -> %g (%@)", v, NSStringFromClass([self class]));
+            diagLogB(@"speedMultiplierForLiftToWake -> %g (%@)", v, NSStringFromClass([(id)self class]));
         }else{
             diagLogClassOnce(@"speedMultiplierForLiftToWake", self, v);
         }
@@ -776,7 +776,7 @@ static void startLockPolling(void){
         //the stock delay always wins there.
         if (isOnSpringBoard && deviceLocked){
             double stock = %orig;
-            diagLogB(@"dismissDelay while locked -> stock %g (SwitcherDismiss=%g, %@)", stock, SwitcherDismiss, NSStringFromClass([self class]));
+            diagLogB(@"dismissDelay while locked -> stock %g (SwitcherDismiss=%g, %@)", stock, SwitcherDismiss, NSStringFromClass([(id)self class]));
             return stock;
         }
         //Volume HUD exemption: the HUD's auto-hide timing also flows through this
