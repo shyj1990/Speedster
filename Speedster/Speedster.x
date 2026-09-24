@@ -352,6 +352,65 @@ static void unlockSampleTrace(NSString *tag, double value){
     diagLog(@"%@", line);
 }
 
+//Folder speed on iOS 17 -------------------------------------------------------------
+//The folder zoom animation reads response/dampingRatio from a long-lived
+//SBFFluidBehaviorSettings object that SpringBoard configures ONCE (during our boot
+//grace) and only READS afterwards - the setter hooks never fire for folder opens.
+//Fix: identify the folder object by its stable caller fingerprint in the getter
+//backtrace (SpringBoard image-relative offsets, slide-independent across boots) and
+//scale the values at READ time. Nothing is ever written, so lock-screen machinery
+//always sees stock values (deviceLocked short-circuits before this runs).
+static NSMapTable *folderFluidObjects; //object -> @YES(folder)/@NO(not folder)
+static NSInteger folderTraceBudget = 0;
+static CFTimeInterval lastFolderTraceTime = 0;
+
+static BOOL folderCallerFingerprint(void){
+    void *frames[24] = {0};
+    int n = backtrace(frames, 24);
+    for (int i = 2; i < n && i < 16; i++) {
+        Dl_info info;
+        memset(&info, 0, sizeof(info));
+        if (dladdr(frames[i], &info) && info.dli_fname) {
+            const char *base = strrchr(info.dli_fname, '/');
+            const char *img = base ? base + 1 : info.dli_fname;
+            if (!strcmp(img, "SpringBoard")) {
+                uintptr_t off = (uintptr_t)frames[i] - (uintptr_t)info.dli_fbase;
+                if (off == 0x77d970 || off == 0x77e3e4 || off == 0x77e448 || off == 0x77e480) return YES;
+            }
+        }
+    }
+    return NO;
+}
+
+//Per-object decision cache + read-time folder acceleration. Called only while
+//unlocked, outside all grace/HUD windows, and behind the value gate in the getters.
+static double folderSpeedAdjust(id obj, double v, BOOL isResponse){
+    if(!folderFluidObjects) folderFluidObjects = [NSMapTable strongToStrongObjectsMapTable];
+    id flag = nil;
+    [stockValuesLock lock];
+    flag = [folderFluidObjects objectForKey:obj];
+    [stockValuesLock unlock];
+    if(flag){ //known object: O(1) decision, no backtrace
+        if([flag isEqual:@YES]) return v * reverseFolderSliderValue(isResponse ? FolderMassValue : FolderDampingValue);
+        return v;
+    }
+    if(folderTraceBudget <= 0) return v;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if(now - lastFolderTraceTime < 0.05) return v; //rate-limit evaluations
+    lastFolderTraceTime = now;
+    folderTraceBudget--;
+    BOOL hit = folderCallerFingerprint();
+    [stockValuesLock lock];
+    [folderFluidObjects setObject:(hit ? @YES : @NO) forKey:obj];
+    [stockValuesLock unlock];
+    if(hit){
+        double mult = reverseFolderSliderValue(isResponse ? FolderMassValue : FolderDampingValue);
+        diagLog(@"[folder-obj] %p identified (%@), value %g -> x%g", obj, isResponse ? @"response" : @"dampingRatio", v, mult);
+        return v * mult;
+    }
+    return v;
+}
+
 //Fluid-8 unlocked-phase sampling: one line per (selector, class) pair. The flash loop
 //most likely runs on a value some controller FROZE out of a settings object while the
 //device was unlocked (same disease as the volume HUD's launch-time freeze), so we need
@@ -390,6 +449,7 @@ static void setDeviceLocked(BOOL locked, const char *source){
     if (!locked) unlockTransitionTime = CFAbsoluteTimeGetCurrent();
     diagBudget = 500; //fresh log budget per lock session
     unlockTraceBudget = 8; //fresh unlocked-read backtrace samples per session
+    folderTraceBudget = 150; //fresh folder fingerprint evaluations per session
     //Fluid-14: the lock pill's animation config is read INSIDE %orig of the lock call,
     //i.e. BEFORE this function used to run at the hook's tail - so every lock started
     //with the pill reading unlock-period tweaked object values and freezing them into
@@ -441,6 +501,10 @@ static void startLockPolling(void){
         if(isOnSpringBoard && !deviceLocked){
             diagLogClassOnce(@"get-response", self, v);
             unlockSampleTrace(@"get-response", v);
+            if(!bootGraceActive() && !unlockGraceActive() && !volumeHUDActive
+               && v > 0.4 && v < 0.65 && isFolderAnimationEnabled){
+                v = folderSpeedAdjust(self, v, YES);
+            }
         }
         return v;
     }
@@ -449,6 +513,10 @@ static void startLockPolling(void){
         if(isOnSpringBoard && !deviceLocked){
             diagLogClassOnce(@"get-dampingRatio", self, v);
             unlockSampleTrace(@"get-dampingRatio", v);
+            if(!bootGraceActive() && !unlockGraceActive() && !volumeHUDActive
+               && v > 0.75 && v < 0.95 && isFolderAnimationBounceEnabled){
+                v = folderSpeedAdjust(self, v, NO);
+            }
         }
         return v;
     }
@@ -910,7 +978,7 @@ static void startLockPolling(void){
 		diagLogPath = @"/var/mobile/Library/SpeedsterDiag.log";
 		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring
 		diagBudget = 500; //budget for the pre-first-transition (locked after respring) session
-		diagLog(@"Speedster Fluid-17 loaded, deviceLocked(assumed)=%d", deviceLocked);
+		diagLog(@"Speedster Fluid-18 loaded, deviceLocked(assumed)=%d", deviceLocked);
 		Class lockMgrClass = objc_getClass("SBLockScreenManager");
 		if (lockMgrClass) {
 			%init(LockScreenTracker, SBLockScreenManager = lockMgrClass);
