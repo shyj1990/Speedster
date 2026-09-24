@@ -867,20 +867,24 @@ static void startLockPolling(void){
 // %end
 
 //Screen Turn On and Off Speed
-//Fluid-9 ROOT CAUSE (device-log proven): the lock pill flip-flop storm is driven by
-//SBFWakeAnimationSettings getters, NOT by any fluid setter. Fluid-8 logs show the storm
-//starts exactly at the wake read: backlightFadeDuration -> 0.01 and
-//speedMultiplierForWake -> 100 (the slider's raw value used as an animation multiplier),
-//followed by ~500 SBFFluidBehaviorSettings reconfigurations in 2.5s on recurring objects
-//- the pill's show/hide animations complete instantly at 100x, the island state machine
-//re-presents them endlessly (~30 cycles/s), and gives up after ~10s (user report).
-//Every storm value passed through our locked exemption was stock, which is why the
-//setter exemptions (Fluid-6/7/8) could never help. Fix: clamp the wake multiplier to
-//the same 3x cap philosophy as every other Speedster slider, and floor the fade
-//duration at 0.15s (imperceptible vs the user's 0.01s, removes the secondary suspect).
-//Both clamps are logged so a future log can verify the storm is gone.
+//Fluid-13 FINAL root cause: while the device is locked, ANY non-stock wake animation
+//multiplier breaks the lock pill's presentation state machine - the pill's show/hide
+//animations complete faster than the island expects, so it re-presents endlessly
+//(100x = violent flip-flop, 3x = still flip-flops; Fluid-9's clamp wasn't enough).
+//The settings-object "storm" in earlier logs is a red herring: it also fires during
+//the boot grace window when every hook is a pure pass-through. Meanwhile the wake
+//multiplier was the ONLY time-varying tweaked value left while locked, and it is
+//read exactly when the flash appears (screen wake on the lock screen).
+//Fix: while locked all three wake getters return the stock value. The user's wake
+//speed feature keeps working while UNLOCKED (where no lock pill exists anyway).
+//This unavoidably disables 亮屏加速 on the lock screen - iOS 17 hard conflict.
 %hook SBFWakeAnimationSettings
     -(double)backlightFadeDuration{ //Screen turn off speed
+        if(deviceLocked){ //lock screen: pure stock, the pill state machine is sensitive
+            double stock = %orig;
+            diagLogB(@"backlightFadeDuration -> stock %g (%@)", stock, NSStringFromClass([(id)self class]));
+            return stock;
+        }
         double v;
         if(isScreensleepEnable){
             v = reverseTurnOffSpeed(Screensleepvalue);
@@ -891,14 +895,15 @@ static void startLockPolling(void){
             diagLog(@"clamped backlightFadeDuration %g -> 0.15", v);
             v = 0.15;
         }
-        if(deviceLocked){
-            diagLogB(@"backlightFadeDuration -> %g (%@)", v, NSStringFromClass([(id)self class]));
-        }else{
-            diagLogClassOnce(@"backlightFadeDuration", self, v);
-        }
+        diagLogClassOnce(@"backlightFadeDuration", self, v);
         return v;
     }
     -(double)speedMultiplierForWake{ //Screen turn on speed (might be glitchy)
+        if(deviceLocked){ //lock screen: pure stock, ANY multiplier != 1 flip-flops the pill
+            double stock = %orig;
+            diagLogB(@"speedMultiplierForWake -> stock %g (%@)", stock, NSStringFromClass([(id)self class]));
+            return stock;
+        }
         double v;
         if(isScreenwakeEnable){
             v = Screenwakevalue;
@@ -911,14 +916,15 @@ static void startLockPolling(void){
         }else if(v < 1.0){
             v = 1.0;
         }
-        if(deviceLocked){
-            diagLogB(@"speedMultiplierForWake -> %g (%@)", v, NSStringFromClass([(id)self class]));
-        }else{
-            diagLogClassOnce(@"speedMultiplierForWake", self, v);
-        }
+        diagLogClassOnce(@"speedMultiplierForWake", self, v);
         return v;
     }
     -(double)speedMultiplierForLiftToWake{ //Screen turn on speed but for lift to wake (again might be glitchy)
+        if(deviceLocked){ //lock screen: pure stock, ANY multiplier != 1 flip-flops the pill
+            double stock = %orig;
+            diagLogB(@"speedMultiplierForLiftToWake -> stock %g (%@)", stock, NSStringFromClass([(id)self class]));
+            return stock;
+        }
         double v;
         if(isScreenwakeEnable){
             v = Screenwakevalue;
@@ -931,11 +937,7 @@ static void startLockPolling(void){
         }else if(v < 1.0){
             v = 1.0;
         }
-        if(deviceLocked){
-            diagLogB(@"speedMultiplierForLiftToWake -> %g (%@)", v, NSStringFromClass([(id)self class]));
-        }else{
-            diagLogClassOnce(@"speedMultiplierForLiftToWake", self, v);
-        }
+        diagLogClassOnce(@"speedMultiplierForLiftToWake", self, v);
         return v;
     }
 %end
@@ -1086,7 +1088,7 @@ static void startLockPolling(void){
 		diagLogPath = @"/var/mobile/Library/SpeedsterDiag.log";
 		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring
 		diagBudget = 500; //budget for the pre-first-transition (locked after respring) session
-		diagLog(@"Speedster Fluid-12 loaded, deviceLocked(assumed)=%d", deviceLocked);
+		diagLog(@"Speedster Fluid-13 loaded, deviceLocked(assumed)=%d", deviceLocked);
 		//Build the IMP symbol map in the background so storm traces can be resolved
 		//(takes a few seconds; the boot storm may beat it - later sessions are covered)
 		dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ buildImpSymbolMap(); });
