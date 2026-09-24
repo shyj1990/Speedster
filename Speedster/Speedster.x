@@ -41,11 +41,6 @@ static double MassValue;
 static double DampingValue;
 static double DurationValue;
 
-static BOOL isScreenwakeEnable;
-static BOOL isScreensleepEnable;
-static double Screensleepvalue;
-static double Screenwakevalue;
-
 static BOOL isNoiconflyEnable;
 static BOOL isNoiconshakingEnable;
 static BOOL isNoiconZoominSwitcher;
@@ -64,12 +59,6 @@ void preferencesthings(){ //pref starts to look THICC
     isFineTuneBounceEnable = (prefs && [prefs objectForKey:@"isFineTuneBounceEnable"] ? [[prefs valueForKey:@"isFineTuneBounceEnable"] boolValue] : NO );
     FineTuneSpeedValue = (prefs && [prefs objectForKey:@"FineTuneSpeedValue"] ? [[prefs valueForKey:@"FineTuneSpeedValue"] doubleValue] : 1 );
     FineTuneBounceValue = (prefs && [prefs objectForKey:@"FineTuneBounceValue"] ? [[prefs valueForKey:@"FineTuneBounceValue"] doubleValue] : 1 );
-
-    //screen sleep/wake values
-    isScreenwakeEnable = (prefs && [prefs objectForKey:@"isScreenwakeEnable"] ? [[prefs valueForKey:@"isScreenwakeEnable"] boolValue] : NO );
-    isScreensleepEnable = (prefs && [prefs objectForKey:@"isScreensleepEnable"] ? [[prefs valueForKey:@"isScreensleepEnable"] boolValue] : NO );
-    Screensleepvalue = (prefs && [prefs objectForKey:@"Screensleepvalue"] ? [[prefs valueForKey:@"Screensleepvalue"] doubleValue] : 0.01 );
-    Screenwakevalue = (prefs && [prefs objectForKey:@"Screenwakevalue"] ? [[prefs valueForKey:@"Screenwakevalue"] doubleValue] : 2 );
 
     //folder values
     isFolderAnimationEnabled = (prefs && [prefs objectForKey:@"isFolderAnimationEnabled"] ? [[prefs valueForKey:@"isFolderAnimationEnabled"] boolValue] : NO );
@@ -388,6 +377,7 @@ static void unlockSampleTrace(NSString *tag, double value){
 static NSMutableSet *diagUniqueLogged;
 static void diagLogClassOnce(NSString *tag, id obj, double value){
     if (!isOnSpringBoard || !obj || deviceLocked) return;
+    if (diagUniqueLogged && diagUniqueLogged.count >= 64) return; //saturated: skip the per-call string alloc + lock
     initStockMaps();
     NSString *className = NSStringFromClass([obj class]);
     NSString *key = [NSString stringWithFormat:@"%@|%@", tag, className];
@@ -410,164 +400,6 @@ static BOOL queryUILocked(void){
     return !!((BOOL(*)(id, SEL))objc_msgSend)(mgr, @selector(isUILocked));
 }
 
-//Fluid-10 storm caller identification: Fluid-9 device logs killed the wake-multiplier
-//theory - the storm fires ~2s after the lock screen becomes visible even when NO wake
-//getter is ever read (boot session), and every value flowing through the hooked setters
-//during the storm is stock. So the disease is not the value but the CALLER: something
-//re-presents the lock pill endlessly. Capture the call stack of the storm's setter
-//calls and resolve frames through a lazily-built IMP -> [Class selector] map of every
-//ObjC method loaded in SpringBoard. 3 samples per lock session (call #1/#150/#400)
-//cover the storm's beginning, middle and end.
-static NSArray *traceSortedImps;   //ascending IMPs
-static NSArray *traceSortedNames;  //parallel "[Class selector]" strings
-static volatile BOOL traceMapReady = NO;
-static NSInteger stormTraceCount = 0;
-
-static NSString *symbolForAddr(void *addr);
-static void dumpSymbolMapFile(void);
-
-static void buildImpSymbolMap(void){
-    @autoreleasepool {
-        NSMutableArray *imps = [NSMutableArray array];
-        NSMutableArray *names = [NSMutableArray array];
-        unsigned int count = 0;
-        Class *classes = objc_copyClassList(&count);
-        for (unsigned int i = 0; i < count; i++) {
-            @autoreleasepool {
-                unsigned int mCount = 0;
-                Method *methods = class_copyMethodList(classes[i], &mCount);
-                for (unsigned int j = 0; j < mCount; j++) {
-                    IMP imp = method_getImplementation(methods[j]);
-                    if (imp) {
-                        [imps addObject:@((uintptr_t)imp)];
-                        [names addObject:[NSString stringWithFormat:@"[%@ %@]",
-                            NSStringFromClass(classes[i]),
-                            NSStringFromSelector(method_getName(methods[j]))]];
-                    }
-                }
-                if (methods) free(methods);
-            }
-        }
-        if (classes) free(classes);
-        NSMutableArray *pairs = [NSMutableArray arrayWithCapacity:imps.count];
-        for (NSUInteger i = 0; i < imps.count; i++) {
-            [pairs addObject:@[imps[i], names[i]]]; //2-element pair, NOT nested in an extra array
-        }
-        [pairs sortUsingComparator:^NSComparisonResult(NSArray *a, NSArray *b){
-            return [a[0] compare:b[0]];
-        }];
-        NSMutableArray *sortedI = [NSMutableArray arrayWithCapacity:pairs.count];
-        NSMutableArray *sortedN = [NSMutableArray arrayWithCapacity:pairs.count];
-        for (NSArray *p in pairs) {
-            [sortedI addObject:p[0]];
-            [sortedN addObject:p[1]];
-        }
-        traceSortedImps = sortedI;
-        traceSortedNames = sortedN;
-        diagLog(@"imp symbol map built: %lu methods", (unsigned long)sortedI.count);
-        if (sortedI.count) {
-            diagLog(@"imp map range: min=%@ max=%@", sortedI.firstObject, sortedI.lastObject);
-        }
-        traceMapReady = YES;
-        //Self-test: the map must resolve a known shared-cache method imp back to itself.
-        //Fluid-11 resolved every SpringBoard frame to one wrong method, so either the map
-        //misses SpringBoard's own methods or frames and imps live in different ranges.
-        Class fbs = objc_getClass("SBFFluidBehaviorSettings");
-        if (fbs) {
-            Method m = class_getInstanceMethod(fbs, @selector(setResponse:));
-            if (m) {
-                void *imp = (void *)method_getImplementation(m);
-                diagLog(@"map self-test: setResponse imp=%p -> %@", imp, symbolForAddr(imp) ?: @"UNRESOLVED");
-            }
-        }
-        dumpSymbolMapFile();
-    }
-}
-
-//One-shot dump of every ObjC method of the images seen in storm traces (SpringBoard,
-//SpringBoardFoundation, PrototypeTools). The file lets the developer resolve raw frame
-//addresses on the PC precisely, independent of the on-device map's health.
-static void dumpSymbolMapFile(void){
-    @autoreleasepool {
-        NSString *path = @"/var/mobile/Library/SpeedsterSymMap.txt";
-        FILE *f = fopen(path.fileSystemRepresentation, "w");
-        if (!f) { diagLog(@"sym dump: cannot open %@", path); return; }
-        unsigned int count = 0;
-        Class *classes = objc_copyClassList(&count);
-        unsigned long dumped = 0;
-        for (unsigned int i = 0; i < count; i++) {
-            @autoreleasepool {
-                unsigned int mCount = 0;
-                Method *methods = class_copyMethodList(classes[i], &mCount);
-                if (!methods || !mCount) { if (methods) free(methods); continue; }
-                Dl_info info;
-                memset(&info, 0, sizeof(info));
-                BOOL haveImage = dladdr((void *)method_getImplementation(methods[0]), &info) && info.dli_fname;
-                BOOL keep = NO;
-                if (haveImage) {
-                    const char *img = info.dli_fname;
-                    size_t len = strlen(img);
-                    keep = (len >= 12 && !strcmp(img + len - 12, "/SpringBoard"))
-                        || strstr(img, "SpringBoardFoundation") != NULL
-                        || strstr(img, "PrototypeTools") != NULL;
-                }
-                if (keep) {
-                    for (unsigned int j = 0; j < mCount; j++) {
-                        fprintf(f, "0x%lx %s %s\n",
-                                (unsigned long)method_getImplementation(methods[j]),
-                                class_getName(classes[i]),
-                                sel_getName(method_getName(methods[j])));
-                        dumped++;
-                    }
-                }
-                free(methods);
-            }
-        }
-        if (classes) free(classes);
-        fclose(f);
-        diagLog(@"sym dump written: %lu methods -> %@", dumped, path);
-    }
-}
-
-//Nearest method at or below addr (method sizes are unknown; floor match is standard).
-static NSString *symbolForAddr(void *addr){
-    if (!traceMapReady) return nil;
-    NSUInteger lo = 0, hi = traceSortedImps.count;
-    uintptr_t target = (uintptr_t)addr;
-    while (lo < hi) {
-        NSUInteger mid = (lo + hi) / 2;
-        if ([traceSortedImps[mid] unsignedLongValue] <= target) lo = mid + 1; else hi = mid;
-    }
-    if (lo == 0) return nil;
-    return traceSortedNames[lo - 1];
-}
-
-static void logStormTrace(void){
-    void *frames[32] = {0};
-    int n = backtrace(frames, 32);
-    NSMutableString *line = [NSMutableString stringWithFormat:@"storm trace (call #%ld, %d frames):", (long)stormTraceCount, n];
-    for (int i = 2; i < n && i < 18; i++) { //skip our own hook + orig thunk frames
-        //Always log the raw image!offset - the on-device name resolution proved
-        //unreliable (Fluid-11), and raw offsets are resolvable on the PC from the
-        //SpeedsterSymMap.txt dump.
-        NSString *raw = @"?";
-        Dl_info info;
-        memset(&info, 0, sizeof(info));
-        if (dladdr(frames[i], &info) && info.dli_fname) {
-            const char *base = strrchr(info.dli_fname, '/');
-            raw = [NSString stringWithFormat:@"%s!0x%lx", base ? base + 1 : info.dli_fname,
-                   (unsigned long)((uintptr_t)frames[i] - (uintptr_t)info.dli_fbase)];
-        }
-        NSString *sym = symbolForAddr(frames[i]);
-        if (sym) {
-            [line appendFormat:@" <- %@{%@}", sym, raw];
-        } else {
-            [line appendFormat:@" <- %@", raw];
-        }
-    }
-    diagLog(@"%@", line);
-}
-
 static void setDeviceLocked(BOOL locked, const char *source){
     if (locked == deviceLocked) return;
     diagLog(@"deviceLocked %d -> %d (%s)", deviceLocked, locked, source);
@@ -575,7 +407,6 @@ static void setDeviceLocked(BOOL locked, const char *source){
     if (!locked) unlockTransitionTime = CFAbsoluteTimeGetCurrent();
     diagBudget = 500; //fresh log budget per lock session
     unlockTraceBudget = 8; //fresh unlocked-read backtrace samples per session
-    stormTraceCount = 0; //fresh storm-trace samples per lock session
     //Fluid-14: the lock pill's animation config is read INSIDE %orig of the lock call,
     //i.e. BEFORE this function used to run at the hook's tail - so every lock started
     //with the pill reading unlock-period tweaked object values and freezing them into
@@ -667,8 +498,6 @@ static void startLockPolling(void){
         }
         if(deviceLocked){ //lock-screen island/UI (e.g. lock pill) animations run stock
             diagLogB(@"setResponse %g while locked (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self);
-            stormTraceCount++;
-            if (stormTraceCount == 1 || stormTraceCount == 150 || stormTraceCount == 400) logStormTrace();
             %orig;
             return;
         }
@@ -983,9 +812,10 @@ static void startLockPolling(void){
 //the boot grace window when every hook is a pure pass-through. Meanwhile the wake
 //multiplier was the ONLY time-varying tweaked value left while locked, and it is
 //read exactly when the flash appears (screen wake on the lock screen).
-//Fix: while locked all three wake getters return the stock value. The user's wake
-//speed feature keeps working while UNLOCKED (where no lock pill exists anyway).
-//This unavoidably disables 亮屏加速 on the lock screen - iOS 17 hard conflict.
+//Fluid-16: all three wake getters return the stock value in EVERY state - the Fluid-15
+//log proved the poison read happens ~1.3s BEFORE the lock flag flips (backlight-off
+//prep), so no state window is safe. The wake/sleep speed features are fully retired
+//(iOS 17 hard conflict with the lock pill); no hook anywhere writes these values.
 %hook SBFWakeAnimationSettings
     //Fluid-16 FINAL: all three getters return stock ALWAYS. The Fluid-15 log caught the
     //smoking gun: ~1.3s before EVERY lock (lock button -> backlight fade prep), while the
@@ -1177,10 +1007,7 @@ static void startLockPolling(void){
 		diagLogPath = @"/var/mobile/Library/SpeedsterDiag.log";
 		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring
 		diagBudget = 500; //budget for the pre-first-transition (locked after respring) session
-		diagLog(@"Speedster Fluid-16 loaded, deviceLocked(assumed)=%d", deviceLocked);
-		//Build the IMP symbol map in the background so storm traces can be resolved
-		//(takes a few seconds; the boot storm may beat it - later sessions are covered)
-		dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ buildImpSymbolMap(); });
+		diagLog(@"Speedster Fluid-17 loaded, deviceLocked(assumed)=%d", deviceLocked);
 		Class lockMgrClass = objc_getClass("SBLockScreenManager");
 		if (lockMgrClass) {
 			%init(LockScreenTracker, SBLockScreenManager = lockMgrClass);
