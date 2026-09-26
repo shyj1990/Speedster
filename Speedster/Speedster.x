@@ -189,8 +189,6 @@ static BOOL bootGraceActive(void){
 - (void)setDampingRatio:(double)arg1;
 - (void)setDamping:(double)arg1;
 - (void)setMass:(double)arg1;
-- (double)response;
-- (double)dampingRatio;
 - (double)damping;
 - (double)mass;
 @end
@@ -719,8 +717,12 @@ static void startLockPolling(void){
                     if ([animator respondsToSelector:@selector(dockAnimationSettings)]) {
                         id dock = [animator performSelector:@selector(dockAnimationSettings)];
                         if (dock && [dock respondsToSelector:@selector(response)]) {
+                            //direct msgSend: UIKit declares a differently-typed -response somewhere,
+                            //so the bracket syntax fails the ambiguity check
+                            double resp = ((double(*)(id, SEL))objc_msgSend)(dock, @selector(response));
+                            double damp = ((double(*)(id, SEL))objc_msgSend)(dock, @selector(dampingRatio));
                             diagLogB(@"[folder-animator] dock=%p %@ response=%g dampingRatio=%g",
-                                     dock, NSStringFromClass([dock class]), [(id)dock response], [(id)dock dampingRatio]);
+                                     dock, NSStringFromClass([dock class]), resp, damp);
                         }
                     }
                     speedsterInternalProbe = NO;
