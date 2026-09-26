@@ -838,7 +838,7 @@ static void folderScaleBSAnimSettingsInPlace(id settings, const char *via){
     double mult = 1.0;
     if (isFolderAnimationEnabled && FolderMassValue > 0.0005) mult = reverseFolderSliderValue(FolderMassValue);
     double zeta = 1.0;
-    if (isFolderBounceEnabled && FolderDampingValue > 0.0005) zeta = reverseFolderSliderValue(FolderDampingValue);
+    if (isFolderAnimationBounceEnabled && FolderDampingValue > 0.0005) zeta = reverseFolderSliderValue(FolderDampingValue);
     if (mult >= 1.0 && zeta >= 1.0) return;
     @try {
         NSString *cls = NSStringFromClass([settings class]);
