@@ -1023,7 +1023,9 @@ static void folderRestoreBSAnimSettings(id settings){
     //mass
     -(void)setMass:(double)arg1{ //in app speed
         if(inAppAnimationEnabled && !isOnSpringBoard){
-            %orig(arg1 * reverseAppSpeedSliderValue(MassValue));
+            double out = arg1 * reverseAppSpeedSliderValue(MassValue);
+            diagLogB(@"[app-ca] mass %g->%g", arg1, out);
+            %orig(out);
         }else{
             %orig(arg1);
         }
@@ -1031,10 +1033,57 @@ static void folderRestoreBSAnimSettings(id settings){
 
     -(void)setDamping:(double)arg1{
         if((inAppAnimationEnabled && inAppAnimationBounceEnabled) && !isOnSpringBoard){
-            %orig(arg1 * reverseAppSpeedSliderValue(DampingValue));
+            double out = arg1 * reverseAppSpeedSliderValue(DampingValue);
+            diagLogB(@"[app-ca] damping %g->%g", arg1, out);
+            %orig(out);
         }else{
             %orig(arg1);
         }
+    }
+
+%end
+
+//Fluid-28: modern in-app springs. iOS 17 UIKit springs are built through
+//UISpringTimingParameters initializers (the UIViewPropertyAnimator path); the
+//legacy CASpringAnimation setters above are almost never called anymore, which
+//is why in-app speed never took effect. Initializer hooks scale plain value
+//arguments before forwarding - no object identity changes, no KVC, no getter
+//exceptions, so the Fluid-25 failure class is impossible by construction.
+//Uniform time dilation (mult<1 = faster): stiffness/(mult^2), damping/(mult)
+//[x zeta for bounce]; mass and dampingRatio are shape/units knobs and stay put.
+%hook UISpringTimingParameters
+
+    - (instancetype)initWithMass:(CGFloat)mass stiffness:(CGFloat)stiffness dampingRatio:(CGFloat)dampingRatio initialVelocity:(CGVector)velocity {
+        double mult = 1.0, zeta = 1.0;
+        if (inAppAnimationEnabled && !isOnSpringBoard && MassValue > 0.0005) mult = reverseAppSpeedSliderValue(MassValue);
+        if (inAppAnimationEnabled && inAppAnimationBounceEnabled && !isOnSpringBoard && DampingValue > 0.0005) zeta = reverseAppSpeedSliderValue(DampingValue);
+        if (mult >= 1.0 && zeta >= 1.0) return %orig;
+        double k = stiffness / (mult * mult);
+        double zr = dampingRatio * zeta;
+        diagLogB(@"[app-spring] mass %g k %g->%g zeta %g->%g", mass, stiffness, k, dampingRatio, zr);
+        return %orig(mass, k, zr, velocity);
+    }
+
+    - (instancetype)initWithDampingRatio:(CGFloat)dampingRatio frequencyResponse:(CGFloat)frequencyResponse initialVelocity:(CGVector)velocity {
+        double mult = 1.0, zeta = 1.0;
+        if (inAppAnimationEnabled && !isOnSpringBoard && MassValue > 0.0005) mult = reverseAppSpeedSliderValue(MassValue);
+        if (inAppAnimationEnabled && inAppAnimationBounceEnabled && !isOnSpringBoard && DampingValue > 0.0005) zeta = reverseAppSpeedSliderValue(DampingValue);
+        if (mult >= 1.0 && zeta >= 1.0) return %orig;
+        double f = frequencyResponse / mult;
+        double zr = dampingRatio * zeta;
+        diagLogB(@"[app-spring] freq %g->%g zeta %g->%g", frequencyResponse, f, dampingRatio, zr);
+        return %orig(zr, f, velocity);
+    }
+
+    - (instancetype)initWithDampingCoefficient:(CGFloat)dampingCoefficient mass:(CGFloat)mass stiffness:(CGFloat)stiffness initialVelocity:(CGVector)velocity {
+        double mult = 1.0, zeta = 1.0;
+        if (inAppAnimationEnabled && !isOnSpringBoard && MassValue > 0.0005) mult = reverseAppSpeedSliderValue(MassValue);
+        if (inAppAnimationEnabled && inAppAnimationBounceEnabled && !isOnSpringBoard && DampingValue > 0.0005) zeta = reverseAppSpeedSliderValue(DampingValue);
+        if (mult >= 1.0 && zeta >= 1.0) return %orig;
+        double k = stiffness / (mult * mult);
+        double c = dampingCoefficient * zeta / mult;
+        diagLogB(@"[app-spring] mass %g k %g->%g c %g->%g", mass, stiffness, k, dampingCoefficient, c);
+        return %orig(c, mass, k, velocity);
     }
 
 %end
@@ -1246,7 +1295,7 @@ static void folderRestoreBSAnimSettings(id settings){
 		diagLogPath = @"/var/mobile/Library/SpeedsterDiag.log";
 		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring
 		diagBudget = 500; //budget for the pre-first-transition (locked after respring) session
-		diagLog(@"Speedster Fluid-27 loaded, deviceLocked(assumed)=%d", deviceLocked);
+		diagLog(@"Speedster Fluid-28 loaded, deviceLocked(assumed)=%d", deviceLocked);
 		Class lockMgrClass = objc_getClass("SBLockScreenManager");
 		if (lockMgrClass) {
 			%init(LockScreenTracker, SBLockScreenManager = lockMgrClass);
