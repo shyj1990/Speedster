@@ -824,19 +824,34 @@ static id folderScaleBSAnimSettings(id settings, const char *via){
     double mult = reverseFolderSliderValue(FolderMassValue);
     if (mult >= 1.0) return settings;
     @try {
-        double dur = [settings respondsToSelector:@selector(duration)] ? ((double(*)(id, SEL))objc_msgSend)(settings, @selector(duration)) : -1;
-        double m = [settings respondsToSelector:@selector(mass)] ? ((double(*)(id, SEL))objc_msgSend)(settings, @selector(mass)) : -1;
-        double k = [settings respondsToSelector:@selector(stiffness)] ? ((double(*)(id, SEL))objc_msgSend)(settings, @selector(stiffness)) : -1;
-        double c = [settings respondsToSelector:@selector(damping)] ? ((double(*)(id, SEL))objc_msgSend)(settings, @selector(damping)) : -1;
-        float spd = [settings respondsToSelector:@selector(speed)] ? ((float(*)(id, SEL))objc_msgSend)(settings, @selector(speed)) : -1;
+        //Fluid-25: the settings come in two flavors. Field logs showed the folder zoom
+        //passes BSMutableSpringAnimationSettings (mass/stiffness/damping, NO duration
+        //key - KVC write threw) and plain timed settings (whose mass getter THROWS
+        //"cannot call mass if not a spring animation"). Branch by class name, wrap
+        //every read, and never touch the wrong flavor's keys.
+        NSString *cls = NSStringFromClass([settings class]);
+        BOOL spring = [cls rangeOfString:@"Spring"].location != NSNotFound;
         id out = [settings respondsToSelector:@selector(mutableCopy)] ? [(id)settings mutableCopy] : settings;
-        if (dur > 0) [(id)out setValue:@(dur * mult) forKey:@"duration"];
-        if (k > 0) [(id)out setValue:@(k * mult * mult) forKey:@"stiffness"];
-        if (c > 0) [(id)out setValue:@(c * mult) forKey:@"damping"];
-        diagLogB(@"[rev-anim] via=%s dur %g->%g m %g k %g->%g c %g->%g spd %g", via,
-                 dur, dur > 0 ? dur * mult : dur, m,
-                 k, k > 0 ? k * mult * mult : k,
-                 c, c > 0 ? c * mult : c, spd);
+        double dur = -1, m = -1, k = -1, c = -1;
+        float spd = -1;
+        if (spring) {
+            //uniform time dilation: k*mult^2 + c*mult keeps omega x mult, zeta fixed
+            @try { k = ((double(*)(id, SEL))objc_msgSend)(out, @selector(stiffness)); } @catch (NSException *e) {}
+            @try { c = ((double(*)(id, SEL))objc_msgSend)(out, @selector(damping)); } @catch (NSException *e) {}
+            @try { m = ((double(*)(id, SEL))objc_msgSend)(out, @selector(mass)); } @catch (NSException *e) {}
+            @try { spd = ((float(*)(id, SEL))objc_msgSend)(out, @selector(speed)); } @catch (NSException *e) {}
+            if (k > 0) [(id)out setValue:@(k * mult * mult) forKey:@"stiffness"];
+            if (c > 0) [(id)out setValue:@(c * mult) forKey:@"damping"];
+            diagLogB(@"[rev-anim] via=%s SPRING k %g->%g c %g->%g m %g spd %g", via,
+                     k, k > 0 ? k * mult * mult : k,
+                     c, c > 0 ? c * mult : c, m, spd);
+        } else {
+            @try { dur = ((double(*)(id, SEL))objc_msgSend)(out, @selector(duration)); } @catch (NSException *e) {}
+            @try { spd = ((float(*)(id, SEL))objc_msgSend)(out, @selector(speed)); } @catch (NSException *e) {}
+            if (dur > 0) [(id)out setValue:@(dur * mult) forKey:@"duration"];
+            diagLogB(@"[rev-anim] via=%s TIMED dur %g->%g spd %g", via,
+                     dur, dur > 0 ? dur * mult : dur, spd);
+        }
         return out;
     } @catch (NSException *e) {
         diagLogB(@"[rev-anim] scale threw %@", e);
@@ -1205,7 +1220,7 @@ static id folderScaleBSAnimSettings(id settings, const char *via){
 		diagLogPath = @"/var/mobile/Library/SpeedsterDiag.log";
 		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring
 		diagBudget = 500; //budget for the pre-first-transition (locked after respring) session
-		diagLog(@"Speedster Fluid-24 loaded, deviceLocked(assumed)=%d", deviceLocked);
+		diagLog(@"Speedster Fluid-25 loaded, deviceLocked(assumed)=%d", deviceLocked);
 		Class lockMgrClass = objc_getClass("SBLockScreenManager");
 		if (lockMgrClass) {
 			%init(LockScreenTracker, SBLockScreenManager = lockMgrClass);
