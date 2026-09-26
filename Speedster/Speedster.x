@@ -1032,7 +1032,7 @@ static void folderRestoreBSAnimSettings(id settings){
     }
 
     -(void)setDamping:(double)arg1{
-        if((inAppAnimationEnabled && inAppAnimationBounceEnabled) && !isOnSpringBoard){
+        if((inAppAnimationEnabled && inAppAnimationBounceEnabled) && !isOnSpringBoard && DampingValue > 0.0005){
             double out = arg1 * reverseAppSpeedSliderValue(DampingValue);
             diagLogB(@"[app-ca] damping %g->%g", arg1, out);
             %orig(out);
@@ -1086,6 +1086,88 @@ static void folderRestoreBSAnimSettings(id settings){
         return %orig(c, mass, k, velocity);
     }
 
+%end
+
+//Fluid-30: the VISIBLE app transitions (navigation push/pop, modals, crossfades,
+//keyboards) are TIMED animations, not springs - that is why scaling spring mass
+//(Fluid-28, confirmed firing 224x in the field log) was imperceptible. Hook the
+//UIKit animation entry points plus CAAnimation's duration setter. All hooks scale
+//plain value arguments before forwarding (no object identity changes, no KVC, no
+//getter exceptions - the Fluid-25 failure class stays impossible by construction).
+//The same DurationMassValue slider drives springs and timed animations; mult<1 =
+//faster. In-app bounce slider scales the spring-variant's damping ratio only.
+%hook UIView
+
+    + (void)animateWithDuration:(double)arg1 animations:(id)arg2 {
+        double out = arg1;
+        if (inAppAnimationEnabled && !isOnSpringBoard && MassValue > 0.0005) {
+            out = arg1 * reverseAppSpeedSliderValue(MassValue);
+            diagLogB(@"[app-timed] UIView.animate %g->%g", arg1, out);
+        }
+        %orig(out, arg2);
+    }
+
+    + (void)animateWithDuration:(double)arg1 animations:(id)arg2 completion:(id)arg3 {
+        double out = arg1;
+        if (inAppAnimationEnabled && !isOnSpringBoard && MassValue > 0.0005) {
+            out = arg1 * reverseAppSpeedSliderValue(MassValue);
+            diagLogB(@"[app-timed] UIView.animate %g->%g", arg1, out);
+        }
+        %orig(out, arg2, arg3);
+    }
+
+    + (void)animateWithDuration:(double)arg1 delay:(double)arg2 options:(unsigned long long)arg3 animations:(id)arg4 completion:(id)arg5 {
+        double out = arg1;
+        if (inAppAnimationEnabled && !isOnSpringBoard && MassValue > 0.0005) {
+            out = arg1 * reverseAppSpeedSliderValue(MassValue);
+            diagLogB(@"[app-timed] UIView.animate %g->%g", arg1, out);
+        }
+        %orig(out, arg2, arg3, arg4, arg5);
+    }
+
+    + (void)animateWithDuration:(double)arg1 delay:(double)arg2 usingSpringWithDamping:(double)arg3 initialSpringVelocity:(double)arg4 options:(unsigned long long)arg5 animations:(id)arg6 completion:(id)arg7 {
+        if (inAppAnimationEnabled && !isOnSpringBoard && MassValue > 0.0005) {
+            double mult = reverseAppSpeedSliderValue(MassValue);
+            double zeta = (inAppAnimationBounceEnabled && DampingValue > 0.0005) ? reverseAppSpeedSliderValue(DampingValue) : 1.0;
+            double out = arg1 * mult;
+            double damp = arg3 * zeta;
+            diagLogB(@"[app-timed] UIView.spring dur %g->%g damping %g->%g", arg1, out, arg3, damp);
+            %orig(out, arg2, damp, arg4, arg5, arg6, arg7);
+        } else {
+            %orig;
+        }
+    }
+
+    + (void)animateKeyframesWithDuration:(double)arg1 delay:(double)arg2 options:(unsigned long long)arg3 animations:(id)arg4 completion:(id)arg5 {
+        double out = arg1;
+        if (inAppAnimationEnabled && !isOnSpringBoard && MassValue > 0.0005) {
+            out = arg1 * reverseAppSpeedSliderValue(MassValue);
+            diagLogB(@"[app-timed] UIView.keyframes %g->%g", arg1, out);
+        }
+        %orig(out, arg2, arg3, arg4, arg5);
+    }
+
+    + (void)transitionWithView:(id)arg1 duration:(double)arg2 options:(unsigned long long)arg3 animations:(id)arg4 completion:(id)arg5 {
+        double out = arg2;
+        if (inAppAnimationEnabled && !isOnSpringBoard && MassValue > 0.0005) {
+            out = arg2 * reverseAppSpeedSliderValue(MassValue);
+            diagLogB(@"[app-timed] UIView.transition %g->%g", arg2, out);
+        }
+        %orig(arg1, out, arg3, arg4, arg5);
+    }
+
+%end
+
+%hook CAAnimation
+    - (void)setDuration:(double)arg1 {
+        if (inAppAnimationEnabled && !isOnSpringBoard && MassValue > 0.0005 && arg1 > 0.0001) {
+            double out = arg1 * reverseAppSpeedSliderValue(MassValue);
+            diagLogB(@"[app-timed] CA duration %g->%g", arg1, out);
+            %orig(out);
+        } else {
+            %orig(arg1);
+        }
+    }
 %end
 
 //Screen Turn On and Off Speed
@@ -1287,9 +1369,9 @@ static void folderRestoreBSAnimSettings(id settings){
 	diagBudget = isOnSpringBoard ? 500 : 300;
 	if (isOnSpringBoard) {
 		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring (SpringBoard only)
-		diagLog(@"Speedster Fluid-29 loaded in SpringBoard, deviceLocked(assumed)=%d", deviceLocked);
+		diagLog(@"Speedster Fluid-30 loaded in SpringBoard, deviceLocked(assumed)=%d", deviceLocked);
 	} else {
-		diagLog(@"Speedster Fluid-29 injected into app process: %@", [NSBundle mainBundle].bundleIdentifier);
+		diagLog(@"Speedster Fluid-30 injected into app process: %@", [NSBundle mainBundle].bundleIdentifier);
 	}
 
 	if (isOnSpringBoard) {
