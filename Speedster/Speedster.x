@@ -805,76 +805,97 @@ static void folderScaleDockValue(id obj, BOOL isResponse, double mult){
 
 %end
 
-//Fluid-24: the REAL folder zoom timing knob. Field logs (Fluid-23) prove the zoom
+//Fluid-24/26: the REAL folder zoom timing knob. Field logs (Fluid-23) prove the zoom
 //never consumes SBFFluidBehaviorSettings response/dampingRatio (rewriting them -
 //even through the global setResponse: slider hook - has zero visual effect) and
 //the SBH*Settings chain carries no duration members. The zoom is driven by
 //SBReversibleLayerPropertyAnimator (homeScreenScaleAnimator + targetIconScaleX/Y
 //Animators on SBScaleIconZoomAnimator) whose animateWithSettings: family takes a
 //BaseBoard BSAnimationSettings (duration / mass / stiffness / damping / speed).
-//Uniform time dilation preserving the spring shape exactly: duration*mult,
-//stiffness*mult^2, damping*mult, mass untouched - omega scales by mult and zeta
-//stays invariant, so the motion curve is identical, just mult times faster.
-//Window-gated to the folder zoom (folderReadWindowUntil) so nothing else is hit.
-//speed is logged but NOT scaled (avoid double dilation if both paths apply).
-static id folderScaleBSAnimSettings(id settings, const char *via){
-    if (!settings || !isOnSpringBoard || deviceLocked) return settings;
-    if (CFAbsoluteTimeGetCurrent() > folderReadWindowUntil) return settings;
-    if (!isFolderAnimationEnabled || FolderMassValue <= 0.0005) return settings;
+//Acceleration = uniform time dilation: duration*mult, stiffness/(mult^2),
+//damping/mult, mass untouched - omega scales by 1/mult and zeta stays invariant,
+//so the motion curve is identical, just mult times faster. Window-gated to the
+//folder zoom (folderReadWindowUntil) so nothing else is hit.
+//Fluid-26: in-place capture/scale/restore. Fluid-25 taught two hard lessons:
+//(1) the spring time-dilation math was INVERTED - k*mult^2 actually SLOWS the
+//spring (correct acceleration is stiffness/(mult^2), damping/mult, so omega
+//scales by 1/mult); (2) handing %orig a mutableCopy broke _reverseWithSettings:'s
+//object-identity validation AND nested hook calls re-scaled the same values
+//(snowball k 341.51 -> 3.4e-6) => uncaught exception => SIGABRT safe mode.
+//Rules going forward: NEVER pass a different object identity into the animation
+//system, ALWAYS restore stock values right after %orig, and mark in-flight
+//objects (associated object) so nested calls cannot double-scale. The reversal
+//path (_reverseWithSettings:) is no longer hooked at all - it stays stock.
+static void *folderBSScaleSavedKey = &folderBSScaleSavedKey;
+static void folderScaleBSAnimSettingsInPlace(id settings, const char *via){
+    if (!settings) return;
+    if (!isOnSpringBoard || deviceLocked) return;
+    if (CFAbsoluteTimeGetCurrent() > folderReadWindowUntil) return;
+    if (!isFolderAnimationEnabled || FolderMassValue <= 0.0005) return;
+    if (objc_getAssociatedObject(settings, folderBSScaleSavedKey)) return; //re-entrant: outer call already scaled this object
     double mult = reverseFolderSliderValue(FolderMassValue);
-    if (mult >= 1.0) return settings;
+    if (mult >= 1.0) return;
     @try {
-        //Fluid-25: the settings come in two flavors. Field logs showed the folder zoom
-        //passes BSMutableSpringAnimationSettings (mass/stiffness/damping, NO duration
-        //key - KVC write threw) and plain timed settings (whose mass getter THROWS
-        //"cannot call mass if not a spring animation"). Branch by class name, wrap
-        //every read, and never touch the wrong flavor's keys.
         NSString *cls = NSStringFromClass([settings class]);
         BOOL spring = [cls rangeOfString:@"Spring"].location != NSNotFound;
-        id out = [settings respondsToSelector:@selector(mutableCopy)] ? [(id)settings mutableCopy] : settings;
-        double dur = -1, m = -1, k = -1, c = -1;
-        float spd = -1;
+        NSMutableDictionary *saved = [NSMutableDictionary dictionary];
         if (spring) {
-            //uniform time dilation: k*mult^2 + c*mult keeps omega x mult, zeta fixed
-            @try { k = ((double(*)(id, SEL))objc_msgSend)(out, @selector(stiffness)); } @catch (NSException *e) {}
-            @try { c = ((double(*)(id, SEL))objc_msgSend)(out, @selector(damping)); } @catch (NSException *e) {}
-            @try { m = ((double(*)(id, SEL))objc_msgSend)(out, @selector(mass)); } @catch (NSException *e) {}
-            @try { spd = ((float(*)(id, SEL))objc_msgSend)(out, @selector(speed)); } @catch (NSException *e) {}
-            if (k > 0) [(id)out setValue:@(k * mult * mult) forKey:@"stiffness"];
-            if (c > 0) [(id)out setValue:@(c * mult) forKey:@"damping"];
-            diagLogB(@"[rev-anim] via=%s SPRING k %g->%g c %g->%g m %g spd %g", via,
-                     k, k > 0 ? k * mult * mult : k,
-                     c, c > 0 ? c * mult : c, m, spd);
+            double k = 0, c = 0;
+            @try { k = ((double(*)(id, SEL))objc_msgSend)(settings, @selector(stiffness)); } @catch (NSException *e) { return; }
+            @try { c = ((double(*)(id, SEL))objc_msgSend)(settings, @selector(damping)); } @catch (NSException *e) { return; }
+            if (k <= 0 && c <= 0) return;
+            saved[@"stiffness"] = @(k);
+            saved[@"damping"] = @(c);
+            [(id)settings setValue:@(k / (mult * mult)) forKey:@"stiffness"];
+            [(id)settings setValue:@(c / mult) forKey:@"damping"];
+            diagLogB(@"[rev-anim] via=%s SPRING k %g->%g c %g->%g", via, k, k / (mult * mult), c, c / mult);
         } else {
-            @try { dur = ((double(*)(id, SEL))objc_msgSend)(out, @selector(duration)); } @catch (NSException *e) {}
-            @try { spd = ((float(*)(id, SEL))objc_msgSend)(out, @selector(speed)); } @catch (NSException *e) {}
-            if (dur > 0) [(id)out setValue:@(dur * mult) forKey:@"duration"];
-            diagLogB(@"[rev-anim] via=%s TIMED dur %g->%g spd %g", via,
-                     dur, dur > 0 ? dur * mult : dur, spd);
+            double dur = 0;
+            @try { dur = ((double(*)(id, SEL))objc_msgSend)(settings, @selector(duration)); } @catch (NSException *e) { return; }
+            if (dur <= 0) return;
+            saved[@"duration"] = @(dur);
+            [(id)settings setValue:@(dur * mult) forKey:@"duration"];
+            diagLogB(@"[rev-anim] via=%s TIMED dur %g->%g", via, dur, dur * mult);
         }
-        return out;
+        objc_setAssociatedObject(settings, folderBSScaleSavedKey, saved, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     } @catch (NSException *e) {
         diagLogB(@"[rev-anim] scale threw %@", e);
-        return settings;
+    }
+}
+static void folderRestoreBSAnimSettings(id settings){
+    if (!settings) return;
+    @try {
+        NSMutableDictionary *saved = objc_getAssociatedObject(settings, folderBSScaleSavedKey);
+        if (!saved) return;
+        for (NSString *key in saved) [(id)settings setValue:saved[key] forKey:key];
+        objc_setAssociatedObject(settings, folderBSScaleSavedKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    } @catch (NSException *e) {
+        diagLogB(@"[rev-anim] restore threw %@", e);
     }
 }
 
 %group ReversibleAnim
 %hook SBReversibleLayerPropertyAnimator
     - (void)animateWithSettings:(id)arg1 completion:(id)arg2 {
-        %orig(folderScaleBSAnimSettings(arg1, "animate"), arg2);
+        folderScaleBSAnimSettingsInPlace(arg1, "animate");
+        %orig;
+        folderRestoreBSAnimSettings(arg1);
     }
     - (void)_animateFromRelativeValue:(double)arg1 toRelativeValue:(double)arg2 withSettings:(id)arg3 beginTime:(id)arg4 {
-        %orig(arg1, arg2, folderScaleBSAnimSettings(arg3, "rel"), arg4);
+        folderScaleBSAnimSettingsInPlace(arg3, "rel");
+        %orig;
+        folderRestoreBSAnimSettings(arg3);
     }
     - (void)_animateFromValue:(double)arg1 toValue:(double)arg2 withSettings:(id)arg3 beginTime:(id)arg4 {
-        %orig(arg1, arg2, folderScaleBSAnimSettings(arg3, "val"), arg4);
+        folderScaleBSAnimSettingsInPlace(arg3, "val");
+        %orig;
+        folderRestoreBSAnimSettings(arg3);
     }
     - (id)_additiveAnimationForKeyPath:(id)arg1 withSettings:(id)arg2 beginTime:(id)arg3 fromRelativeValue:(double)arg4 toRelativeValue:(double)arg5 {
-        return %orig(arg1, folderScaleBSAnimSettings(arg2, "add"), arg3, arg4, arg5);
-    }
-    - (void)_reverseWithSettings:(id)arg1 directionChangeSettings:(id)arg2 headStart:(double)arg3 {
-        %orig(folderScaleBSAnimSettings(arg1, "rev"), arg2, arg3);
+        folderScaleBSAnimSettingsInPlace(arg2, "add");
+        id result = %orig;
+        folderRestoreBSAnimSettings(arg2);
+        return result;
     }
 %end
 %end
@@ -1220,7 +1241,7 @@ static id folderScaleBSAnimSettings(id settings, const char *via){
 		diagLogPath = @"/var/mobile/Library/SpeedsterDiag.log";
 		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring
 		diagBudget = 500; //budget for the pre-first-transition (locked after respring) session
-		diagLog(@"Speedster Fluid-25 loaded, deviceLocked(assumed)=%d", deviceLocked);
+		diagLog(@"Speedster Fluid-26 loaded, deviceLocked(assumed)=%d", deviceLocked);
 		Class lockMgrClass = objc_getClass("SBLockScreenManager");
 		if (lockMgrClass) {
 			%init(LockScreenTracker, SBLockScreenManager = lockMgrClass);
