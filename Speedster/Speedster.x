@@ -1277,6 +1277,21 @@ static void folderRestoreBSAnimSettings(id settings){
 	CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, (CFNotificationCallback)preferencesChanged, CFSTR("com.hoangdus.speedsterprefs-updated"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
 	preferencesChanged();
 
+	//Fluid-29: app-side diagnostics. The diag log used to be initialized only inside
+	//SpringBoard, so the [app-spring]/[app-ca] lines could NEVER appear even when the
+	//in-app hooks fired - in-app activity was invisible by construction. SpringBoard
+	//keeps its fresh-log-per-respring behavior; every other process appends to the
+	//same file (diagLogCore already opens in "a" mode, multi-process safe enough for
+	//diagnosis) with its own budget and a proof-of-injection line.
+	diagLogPath = @"/var/mobile/Library/SpeedsterDiag.log";
+	diagBudget = isOnSpringBoard ? 500 : 300;
+	if (isOnSpringBoard) {
+		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring (SpringBoard only)
+		diagLog(@"Speedster Fluid-29 loaded in SpringBoard, deviceLocked(assumed)=%d", deviceLocked);
+	} else {
+		diagLog(@"Speedster Fluid-29 injected into app process: %@", [NSBundle mainBundle].bundleIdentifier);
+	}
+
 	if (isOnSpringBoard) {
 		//Volume changes made from SpringBoard (hardware buttons etc.) are announced
 		//right before the volume HUD presents - use that as the exemption window trigger.
@@ -1292,10 +1307,6 @@ static void folderRestoreBSAnimSettings(id settings){
 		%init(VolumeHUDExempt, VolumeControl = objc_getClass("SBVolumeControl"));
 
 		//Lock screen exemption wiring (see the lock exemption note above)
-		diagLogPath = @"/var/mobile/Library/SpeedsterDiag.log";
-		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring
-		diagBudget = 500; //budget for the pre-first-transition (locked after respring) session
-		diagLog(@"Speedster Fluid-28 loaded, deviceLocked(assumed)=%d", deviceLocked);
 		Class lockMgrClass = objc_getClass("SBLockScreenManager");
 		if (lockMgrClass) {
 			%init(LockScreenTracker, SBLockScreenManager = lockMgrClass);
