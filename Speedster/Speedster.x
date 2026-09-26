@@ -805,6 +805,65 @@ static void folderScaleDockValue(id obj, BOOL isResponse, double mult){
 
 %end
 
+//Fluid-24: the REAL folder zoom timing knob. Field logs (Fluid-23) prove the zoom
+//never consumes SBFFluidBehaviorSettings response/dampingRatio (rewriting them -
+//even through the global setResponse: slider hook - has zero visual effect) and
+//the SBH*Settings chain carries no duration members. The zoom is driven by
+//SBReversibleLayerPropertyAnimator (homeScreenScaleAnimator + targetIconScaleX/Y
+//Animators on SBScaleIconZoomAnimator) whose animateWithSettings: family takes a
+//BaseBoard BSAnimationSettings (duration / mass / stiffness / damping / speed).
+//Uniform time dilation preserving the spring shape exactly: duration*mult,
+//stiffness*mult^2, damping*mult, mass untouched - omega scales by mult and zeta
+//stays invariant, so the motion curve is identical, just mult times faster.
+//Window-gated to the folder zoom (folderReadWindowUntil) so nothing else is hit.
+//speed is logged but NOT scaled (avoid double dilation if both paths apply).
+static id folderScaleBSAnimSettings(id settings, const char *via){
+    if (!settings || !isOnSpringBoard || deviceLocked) return settings;
+    if (CFAbsoluteTimeGetCurrent() > folderReadWindowUntil) return settings;
+    if (!isFolderAnimationEnabled || FolderMassValue <= 0.0005) return settings;
+    double mult = reverseFolderSliderValue(FolderMassValue);
+    if (mult >= 1.0) return settings;
+    @try {
+        double dur = [settings respondsToSelector:@selector(duration)] ? ((double(*)(id, SEL))objc_msgSend)(settings, @selector(duration)) : -1;
+        double m = [settings respondsToSelector:@selector(mass)] ? ((double(*)(id, SEL))objc_msgSend)(settings, @selector(mass)) : -1;
+        double k = [settings respondsToSelector:@selector(stiffness)] ? ((double(*)(id, SEL))objc_msgSend)(settings, @selector(stiffness)) : -1;
+        double c = [settings respondsToSelector:@selector(damping)] ? ((double(*)(id, SEL))objc_msgSend)(settings, @selector(damping)) : -1;
+        float spd = [settings respondsToSelector:@selector(speed)] ? ((float(*)(id, SEL))objc_msgSend)(settings, @selector(speed)) : -1;
+        id out = [settings respondsToSelector:@selector(mutableCopy)] ? [(id)settings mutableCopy] : settings;
+        if (dur > 0) [(id)out setValue:@(dur * mult) forKey:@"duration"];
+        if (k > 0) [(id)out setValue:@(k * mult * mult) forKey:@"stiffness"];
+        if (c > 0) [(id)out setValue:@(c * mult) forKey:@"damping"];
+        diagLogB(@"[rev-anim] via=%s dur %g->%g m %g k %g->%g c %g->%g spd %g", via,
+                 dur, dur > 0 ? dur * mult : dur, m,
+                 k, k > 0 ? k * mult * mult : k,
+                 c, c > 0 ? c * mult : c, spd);
+        return out;
+    } @catch (NSException *e) {
+        diagLogB(@"[rev-anim] scale threw %@", e);
+        return settings;
+    }
+}
+
+%group ReversibleAnim
+%hook SBReversibleLayerPropertyAnimator
+    - (void)animateWithSettings:(id)arg1 completion:(id)arg2 {
+        %orig(folderScaleBSAnimSettings(arg1, "animate"), arg2);
+    }
+    - (void)_animateFromRelativeValue:(double)arg1 toRelativeValue:(double)arg2 withSettings:(id)arg3 beginTime:(id)arg4 {
+        %orig(arg1, arg2, folderScaleBSAnimSettings(arg3, "rel"), arg4);
+    }
+    - (void)_animateFromValue:(double)arg1 toValue:(double)arg2 withSettings:(id)arg3 beginTime:(id)arg4 {
+        %orig(arg1, arg2, folderScaleBSAnimSettings(arg3, "val"), arg4);
+    }
+    - (id)_additiveAnimationForKeyPath:(id)arg1 withSettings:(id)arg2 beginTime:(id)arg3 fromRelativeValue:(double)arg4 toRelativeValue:(double)arg5 {
+        return %orig(arg1, folderScaleBSAnimSettings(arg2, "add"), arg3, arg4, arg5);
+    }
+    - (void)_reverseWithSettings:(id)arg1 directionChangeSettings:(id)arg2 headStart:(double)arg3 {
+        %orig(folderScaleBSAnimSettings(arg1, "rev"), arg2, arg3);
+    }
+%end
+%end
+
 //Folder open/close zoom, iOS 17 write-side mechanism (Fluid-20)
 //Architecture (verified against iOS 17 runtime headers): SBFolderController
 //_newAnimatorForZoomUp: creates an SBFolderIconZoomAnimator per open/close; the
@@ -1146,7 +1205,7 @@ static void folderScaleDockValue(id obj, BOOL isResponse, double mult){
 		diagLogPath = @"/var/mobile/Library/SpeedsterDiag.log";
 		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring
 		diagBudget = 500; //budget for the pre-first-transition (locked after respring) session
-		diagLog(@"Speedster Fluid-23 loaded, deviceLocked(assumed)=%d", deviceLocked);
+		diagLog(@"Speedster Fluid-24 loaded, deviceLocked(assumed)=%d", deviceLocked);
 		Class lockMgrClass = objc_getClass("SBLockScreenManager");
 		if (lockMgrClass) {
 			%init(LockScreenTracker, SBLockScreenManager = lockMgrClass);
@@ -1165,6 +1224,15 @@ static void folderScaleDockValue(id obj, BOOL isResponse, double mult){
 			diagLog(@"FolderZoom hooks initialized (animator+controller found)");
 		} else {
 			diagLog(@"FolderZoom classes missing: animator=%p controller=%p", folderAnimatorClass, folderControllerClass);
+		}
+
+		//Fluid-24: reversible layer animators carry the REAL zoom timing (BSAnimationSettings)
+		Class reversibleClass = objc_getClass("SBReversibleLayerPropertyAnimator");
+		if (reversibleClass) {
+			%init(ReversibleAnim, SBReversibleLayerPropertyAnimator = reversibleClass);
+			diagLog(@"ReversibleAnim hooks initialized");
+		} else {
+			diagLog(@"SBReversibleLayerPropertyAnimator NOT found");
 		}
 	}
 }
