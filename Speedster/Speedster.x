@@ -201,6 +201,9 @@ static void initStockMaps(void){
         stockDampingValues = [NSMapTable mapTableWithKeyOptions:NSMapTableWeakMemory | NSMapTableObjectPointerPersonality valueOptions:NSMapTableStrongMemory];
         stockMassValues = [NSMapTable mapTableWithKeyOptions:NSMapTableWeakMemory | NSMapTableObjectPointerPersonality valueOptions:NSMapTableStrongMemory];
         stockValuesLock = [NSLock new];
+        folderFluidObjects = [[NSHashTable alloc] initWithOptions:NSPointerFunctionsWeakMemory capacity:16];
+        folderFluidStockResponse = [NSMapTable mapTableWithKeyOptions:NSMapTableWeakMemory | NSMapTableObjectPointerPersonality valueOptions:NSMapTableStrongMemory];
+        folderFluidStockDamping = [NSMapTable mapTableWithKeyOptions:NSMapTableWeakMemory | NSMapTableObjectPointerPersonality valueOptions:NSMapTableStrongMemory];
     });
 }
 
@@ -431,6 +434,96 @@ static void startLockPolling(void){
     dispatch_resume(lockPollTimer);
 }
 
+//Folder fluid settings acceleration (Fluid-21) - identify by read-site fingerprint,
+//accelerate by async WRITE. Fluid-20 proved the folder zoom spring is NOT the
+//centralAnimationSettings (SBFAnimationSettings) the animator passes around: the
+//zoom spring reads response/dampingRatio from SBFFluidBehaviorSettings objects
+//through four stable SpringBoard call sites (image-relative 0x77d970 / 0x77e3e4 /
+//0x77e448 / 0x77e480, boot-stable - confirmed in the Fluid-20 diag log). Those
+//objects are never re-configured through setters on iOS 17, so they cannot be
+//scaled at configuration time - and multiplying values inside the getters is
+//BANNED (Fluid-18 freeze disaster). What touches neither the read path nor the
+//getter's call stack: when a read arrives from one of the four folder sites,
+//remember the object (weak) and on the NEXT main-queue turn write the scaled
+//value with the same setResponse:/setDampingRatio: writes used everywhere else.
+//The first folder open after each respring runs at stock speed (identification
+//pass); every following open is accelerated. If the system ever resets an object,
+//the next read adopts the new baseline and re-queues the scaled write.
+
+static NSHashTable *folderFluidObjects;       //weak refs, folder-read fluid settings
+static NSMapTable *folderFluidStockResponse;  //weak key -> NSNumber stock response
+static NSMapTable *folderFluidStockDamping;   //weak key -> NSNumber stock dampingRatio
+
+static BOOL folderReadSiteInBacktrace(void *frames[], int n){
+    for (int i = 0; i < n; i++) {
+        Dl_info info;
+        if (!dladdr(frames[i], &info) || !info.dli_fname || !info.dli_fbase) continue;
+        const char *slash = strrchr(info.dli_fname, '/');
+        const char *name = slash ? slash + 1 : info.dli_fname;
+        if (strcmp(name, "SpringBoard") != 0) continue;
+        uintptr_t offset = (uintptr_t)frames[i] - (uintptr_t)info.dli_fbase;
+        if (offset == 0x77d970 || offset == 0x77e3e4 || offset == 0x77e448 || offset == 0x77e480) return YES;
+    }
+    return NO;
+}
+
+static void folderFluidApply(id obj, BOOL isResponse, double stock, double mult){
+    if (!obj || ![folderFluidObjects containsObject:obj]) return; //weak ref died
+    double cur = ((double(*)(id, SEL))objc_msgSend)(obj, isResponse ? @selector(response) : @selector(dampingRatio));
+    double target = stock * mult;
+    if (fabs(cur - target) <= 0.0001) return; //already in place
+    restoringForHUD = YES;   //our own writes pass straight through the scaling hooks
+    speedsterInternalProbe = YES;
+    if (isResponse) [(id)obj setResponse:target];
+    else [(id)obj setDampingRatio:target];
+    speedsterInternalProbe = NO;
+    restoringForHUD = NO;
+    diagLogB(@"[folder-fluid] wrote obj=%p %s %g->%g", obj, isResponse ? "response" : "dampingRatio", cur, target);
+}
+
+static void folderFluidReadCheck(id obj, BOOL isResponse, double value){
+    if (!isOnSpringBoard || deviceLocked || speedsterInternalProbe) return;
+    if (value <= 0.0001) return; //unconfigured helper objects, nothing to scale
+    initStockMaps();
+
+    double mult = 0;
+    if (isResponse) {
+        if (isFolderAnimationEnabled && FolderMassValue > 0.0005) mult = reverseFolderSliderValue(FolderMassValue);
+    } else {
+        if (isFolderAnimationEnabled && isFolderAnimationBounceEnabled && FolderDampingValue > 0.0005) mult = reverseFolderSliderValue(FolderDampingValue);
+    }
+
+    BOOL known = [folderFluidObjects containsObject:obj];
+    if (!known) {
+        if (mult == 0) return; //nothing to gain, skip the backtrace walk
+        void *frames[32] = {0};
+        int n = backtrace(frames, 32);
+        if (!folderReadSiteInBacktrace(frames, n)) return;
+        [folderFluidObjects addObject:obj];
+        diagLog(@"[folder-fluid] identified obj=%p %s=%g (folder read site)", obj, isResponse ? "response" : "dampingRatio", value);
+    }
+
+    NSMapTable *stocks = isResponse ? folderFluidStockResponse : folderFluidStockDamping;
+    NSNumber *stockNum = [stocks objectForKey:obj];
+    double stock;
+    if (!stockNum) {
+        if (mult == 0) return;
+        stock = value; //first sight: current value is the stock baseline
+        [stocks setObject:@(value) forKey:obj];
+    } else {
+        stock = [stockNum doubleValue];
+        if (mult > 0 && fabs(stock - value) > 0.0001) {
+            stock = value; //system reconfigured it; adopt the new baseline
+            [stocks setObject:@(value) forKey:obj];
+        }
+    }
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (deviceLocked) return; //retried on the next folder read
+        folderFluidApply(obj, isResponse, stock, mult > 0 ? mult : 1.0); //mult 0 = restore stock
+    });
+}
+
 //App Open animation and bouncing
 %hook SBFFluidBehaviorSettings
     //Fluid-15 read-side instrumentation: while locked every WRITE is stock, so if the
@@ -444,6 +537,7 @@ static void startLockPolling(void){
         if(isOnSpringBoard && !deviceLocked){
             diagLogClassOnce(@"get-response", self, v);
             unlockSampleTrace(@"get-response", self, v);
+            folderFluidReadCheck(self, YES, v);
         }
         return v;
     }
@@ -452,6 +546,7 @@ static void startLockPolling(void){
         if(isOnSpringBoard && !deviceLocked){
             diagLogClassOnce(@"get-dampingRatio", self, v);
             unlockSampleTrace(@"get-dampingRatio", self, v);
+            folderFluidReadCheck(self, NO, v);
         }
         return v;
     }
@@ -757,6 +852,16 @@ static void startLockPolling(void){
                 applied = YES;
                 diagLogB(@"[folder-zoom] frac=%g already=%d mass %g x%.3f damping %g x%.3f obj=%p %@",
                          arg1, arg4, stockMass, massMult, stockDamping, dampingMult, arg2, NSStringFromClass([arg2 class]));
+                if ([self respondsToSelector:@selector(dockAnimationSettings)]) {
+                    speedsterInternalProbe = YES;
+                    id dock = [self performSelector:@selector(dockAnimationSettings)];
+                    if (dock) {
+                        double resp = ((double(*)(id, SEL))objc_msgSend)(dock, @selector(response));
+                        double damp = ((double(*)(id, SEL))objc_msgSend)(dock, @selector(dampingRatio));
+                        diagLogB(@"[folder-zoom] dock=%p %@ resp=%g dr=%g", dock, NSStringFromClass([dock class]), resp, damp);
+                    }
+                    speedsterInternalProbe = NO;
+                }
             }
         }
         %orig;
@@ -999,7 +1104,7 @@ static void startLockPolling(void){
 		diagLogPath = @"/var/mobile/Library/SpeedsterDiag.log";
 		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring
 		diagBudget = 500; //budget for the pre-first-transition (locked after respring) session
-		diagLog(@"Speedster Fluid-20 loaded, deviceLocked(assumed)=%d", deviceLocked);
+		diagLog(@"Speedster Fluid-21 loaded, deviceLocked(assumed)=%d", deviceLocked);
 		Class lockMgrClass = objc_getClass("SBLockScreenManager");
 		if (lockMgrClass) {
 			%init(LockScreenTracker, SBLockScreenManager = lockMgrClass);
