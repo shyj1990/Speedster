@@ -37,3 +37,9 @@
 "Switcher homescreen zoom out" = "多任务界面图标缩放";
 
 "Switcher wallpaper zoom out" = "多任务界面壁纸缩放";
+
+"Folder" = "文件夹打开/关闭";
+
+"FolderAnimation" = "文件夹打开/关闭速度";
+
+"FolderDamping" = "回弹效果";

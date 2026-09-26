@@ -40,7 +40,7 @@ static NSArray *speedsterSliderKeys(void){
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         keys = @[@"FineTuneSpeedValue", @"FineTuneBounceValue", @"DurationMassValue",
-                 @"DampingValue"];
+                 @"DampingValue", @"FolderMassValue", @"FolderDampingValue"];
     });
     return keys;
 }

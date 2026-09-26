@@ -189,6 +189,10 @@ static BOOL bootGraceActive(void){
 - (void)setDampingRatio:(double)arg1;
 - (void)setDamping:(double)arg1;
 - (void)setMass:(double)arg1;
+- (double)response;
+- (double)dampingRatio;
+- (double)damping;
+- (double)mass;
 @end
 
 static void initStockMaps(void){
@@ -332,12 +336,13 @@ static void diagLogB(NSString *fmt, ...){
 //tweak's hook trampoline frames (Fluid-14 SymMap analysis proved the "SpringBoard"
 //frames in storm traces are trampolines), but who-calls-whom is still readable.
 static NSInteger unlockTraceBudget = 0;
-static void unlockSampleTrace(NSString *tag, double value){
-    if (!isOnSpringBoard || deviceLocked || unlockTraceBudget <= 0) return;
+static volatile BOOL speedsterInternalProbe = NO; //suppress sampling while the tweak itself reads values for diagnostics
+static void unlockSampleTrace(NSString *tag, id obj, double value){
+    if (!isOnSpringBoard || deviceLocked || speedsterInternalProbe || unlockTraceBudget <= 0) return;
     unlockTraceBudget--;
     void *frames[32] = {0};
     int n = backtrace(frames, 32);
-    NSMutableString *line = [NSMutableString stringWithFormat:@"[unlock-read] %@ value=%g (%d frames):", tag, value, n];
+    NSMutableString *line = [NSMutableString stringWithFormat:@"[unlock-read] %@ value=%g obj=%p %@ (%d frames):", tag, value, obj, NSStringFromClass([obj class]), n];
     for (int i = 2; i < n && i < 16; i++) {
         Dl_info info;
         memset(&info, 0, sizeof(info));
@@ -389,7 +394,7 @@ static void setDeviceLocked(BOOL locked, const char *source){
     deviceLocked = locked;
     if (!locked) unlockTransitionTime = CFAbsoluteTimeGetCurrent();
     diagBudget = 500; //fresh log budget per lock session
-    unlockTraceBudget = 8; //fresh unlocked-read backtrace samples per session
+    unlockTraceBudget = 12; //fresh unlocked-read backtrace samples per session
     //Fluid-14: the lock pill's animation config is read INSIDE %orig of the lock call,
     //i.e. BEFORE this function used to run at the hook's tail - so every lock started
     //with the pill reading unlock-period tweaked object values and freezing them into
@@ -440,7 +445,7 @@ static void startLockPolling(void){
         double v = %orig;
         if(isOnSpringBoard && !deviceLocked){
             diagLogClassOnce(@"get-response", self, v);
-            unlockSampleTrace(@"get-response", v);
+            unlockSampleTrace(@"get-response", self, v);
         }
         return v;
     }
@@ -448,7 +453,7 @@ static void startLockPolling(void){
         double v = %orig;
         if(isOnSpringBoard && !deviceLocked){
             diagLogClassOnce(@"get-dampingRatio", self, v);
-            unlockSampleTrace(@"get-dampingRatio", v);
+            unlockSampleTrace(@"get-dampingRatio", self, v);
         }
         return v;
     }
@@ -456,7 +461,7 @@ static void startLockPolling(void){
         double v = %orig;
         if(isOnSpringBoard && !deviceLocked){
             diagLogClassOnce(@"get-settlingDuration", self, v);
-            unlockSampleTrace(@"get-settlingDuration", v);
+            unlockSampleTrace(@"get-settlingDuration", self, v);
         }
         return v;
     }
@@ -679,6 +684,88 @@ static void startLockPolling(void){
         }
     }
 
+%end
+
+//Folder open/close zoom, iOS 17 write-side mechanism (Fluid-20)
+//Architecture (verified against iOS 17 runtime headers): SBFolderController
+//_newAnimatorForZoomUp: creates an SBFolderIconZoomAnimator per open/close; the
+//zoom spring is built inside _performAnimationToFraction:withCentralAnimationSettings:
+//from the passed SBFAnimationSettings (SBHFolderZoomSettings.centralAnimationSettings).
+//On iOS 17 those setters only fire ONCE at boot, so the legacy setMass:/setDamping:
+//multiplication hooks above are dead code for folders. NEVER multiply the
+//SBFFluidBehaviorSettings getters (Fluid-18 freeze disaster: read-side scaling
+//watchdog-kills SpringBoard). Instead: write scaled mass/damping into the passed
+//settings object BEFORE %orig (the animation snapshots its parameters there) and
+//restore the stock values right after - the same scoped write/restore pattern the
+//volume HUD and lock pill fixes use. Our own writes pass through the SBFAnimation-
+//Settings hooks via restoringForHUD so nothing gets double-scaled.
+%group FolderZoom
+
+//Diagnostics: identifies which animator class actually runs and what the settings
+//chain holds. If the speed slider ever fails to take effect, these lines say
+//whether the hooks fired and which object the spring really comes from.
+%hook SBFolderController
+    - (id)_newAnimatorForZoomUp:(bool)arg1 {
+        id animator = %orig;
+        if (isOnSpringBoard && animator && !deviceLocked) {
+            diagLogB(@"[folder-animator] zoomUp=%d class=%@", arg1, NSStringFromClass([animator class]));
+            id settings = [animator respondsToSelector:@selector(settings)] ? [animator performSelector:@selector(settings)] : nil;
+            if (settings) {
+                id central = [settings respondsToSelector:@selector(centralAnimationSettings)] ? [settings performSelector:@selector(centralAnimationSettings)] : nil;
+                if (central && [central respondsToSelector:@selector(mass)] && [central respondsToSelector:@selector(damping)]) {
+                    speedsterInternalProbe = YES;
+                    diagLogB(@"[folder-animator] central=%p %@ mass=%g damping=%g",
+                             central, NSStringFromClass([central class]), [(id)central mass], [(id)central damping]);
+                    if ([animator respondsToSelector:@selector(dockAnimationSettings)]) {
+                        id dock = [animator performSelector:@selector(dockAnimationSettings)];
+                        if (dock && [dock respondsToSelector:@selector(response)]) {
+                            diagLogB(@"[folder-animator] dock=%p %@ response=%g dampingRatio=%g",
+                                     dock, NSStringFromClass([dock class]), [(id)dock response], [(id)dock dampingRatio]);
+                        }
+                    }
+                    speedsterInternalProbe = NO;
+                }
+            }
+        }
+        return animator;
+    }
+%end
+
+%hook SBFolderIconZoomAnimator
+    - (void)_performAnimationToFraction:(double)arg1 withCentralAnimationSettings:(id)arg2 delay:(double)arg3 alreadyAnimating:(bool)arg4 sharedCompletion:(id)arg5 {
+        BOOL applied = NO;
+        double savedMass = 0, savedDamping = 0;
+        if (isOnSpringBoard && !deviceLocked && !bootGraceActive() && !volumeHUDActive && arg2
+            && [arg2 respondsToSelector:@selector(mass)] && [arg2 respondsToSelector:@selector(damping)]) {
+            double stockMass = [(id)arg2 mass];
+            double stockDamping = [(id)arg2 damping];
+            double massMult = 1.0, dampingMult = 1.0;
+            if (isFolderAnimationEnabled && FolderMassValue > 0.0005) {
+                massMult = reverseFolderSliderValue(FolderMassValue);
+            }
+            if (isFolderAnimationEnabled && isFolderAnimationBounceEnabled && FolderDampingValue > 0.0005) {
+                dampingMult = reverseFolderSliderValue(FolderDampingValue);
+            }
+            if (massMult != 1.0 || dampingMult != 1.0) {
+                savedMass = stockMass;
+                savedDamping = stockDamping;
+                restoringForHUD = YES; //our writes must bypass the SBFAnimationSettings scaling hooks
+                if (massMult != 1.0) [(id)arg2 setMass:stockMass * massMult];
+                if (dampingMult != 1.0) [(id)arg2 setDamping:stockDamping * dampingMult];
+                applied = YES;
+                diagLogB(@"[folder-zoom] frac=%g already=%d mass %g x%.3f damping %g x%.3f obj=%p %@",
+                         arg1, arg4, stockMass, massMult, stockDamping, dampingMult, arg2, NSStringFromClass([arg2 class]));
+            }
+        }
+        %orig;
+        if (applied) { //the animation snapshotted its parameters inside %orig; restore stock
+            restoringForHUD = YES;
+            [(id)arg2 setMass:savedMass];
+            [(id)arg2 setDamping:savedDamping];
+            restoringForHUD = NO;
+        }
+    }
+%end
 %end
 
 //In-App animation
@@ -910,7 +997,7 @@ static void startLockPolling(void){
 		diagLogPath = @"/var/mobile/Library/SpeedsterDiag.log";
 		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring
 		diagBudget = 500; //budget for the pre-first-transition (locked after respring) session
-		diagLog(@"Speedster Fluid-19 loaded, deviceLocked(assumed)=%d", deviceLocked);
+		diagLog(@"Speedster Fluid-20 loaded, deviceLocked(assumed)=%d", deviceLocked);
 		Class lockMgrClass = objc_getClass("SBLockScreenManager");
 		if (lockMgrClass) {
 			%init(LockScreenTracker, SBLockScreenManager = lockMgrClass);
@@ -920,5 +1007,15 @@ static void startLockPolling(void){
 		}
 		watchLockState();
 		startLockPolling();
+
+		//Folder zoom acceleration (iOS 17 write-side mechanism - see FolderZoom note above)
+		Class folderAnimatorClass = objc_getClass("SBFolderIconZoomAnimator");
+		Class folderControllerClass = objc_getClass("SBFolderController");
+		if (folderAnimatorClass && folderControllerClass) {
+			%init(FolderZoom, SBFolderIconZoomAnimator = folderAnimatorClass, SBFolderController = folderControllerClass);
+			diagLog(@"FolderZoom hooks initialized (animator+controller found)");
+		} else {
+			diagLog(@"FolderZoom classes missing: animator=%p controller=%p", folderAnimatorClass, folderControllerClass);
+		}
 	}
 }

@@ -62,3 +62,9 @@
 
 
 "Switcher wallpaper zoom out" = "Switcher Wallpaper Zoom Out";
+
+"Folder" = "Folder Open/Close";
+
+"FolderAnimation" = "Folder Open/Close Speed";
+
+"FolderDamping" = "Bounce";
