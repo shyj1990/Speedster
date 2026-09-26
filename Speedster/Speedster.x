@@ -362,6 +362,77 @@ static void unlockSampleTrace(NSString *tag, id obj, double value){
     diagLog(@"%@", line);
 }
 
+//Fluid-23 folder read-window tracing. Fluid-22 proved writing the dockAnimation-
+//Settings object right before %orig has NO visual effect, so the real zoom spring
+//reads its parameters somewhere else (or snapshots them earlier). From the moment
+//the folder zoom hook fires, sample every unlocked response/dampingRatio read for
+//~2.5s with raw image!offset backtraces - the log will show exactly which object
+//and which call sites feed the actual folder spring.
+static CFAbsoluteTime folderReadWindowUntil = 0;
+static NSInteger folderReadTraceBudget = 0;
+static void folderSampleTrace(NSString *tag, id obj, double value){
+    if (!isOnSpringBoard || deviceLocked || speedsterInternalProbe || folderReadTraceBudget <= 0) return;
+    if (CFAbsoluteTimeGetCurrent() > folderReadWindowUntil) return;
+    folderReadTraceBudget--;
+    void *frames[32] = {0};
+    int n = backtrace(frames, 32);
+    NSMutableString *line = [NSMutableString stringWithFormat:@"[folder-read] %@ value=%g obj=%p %@ (%d frames):", tag, value, obj, NSStringFromClass([obj class]), n];
+    for (int i = 2; i < n && i < 16; i++) {
+        Dl_info info;
+        memset(&info, 0, sizeof(info));
+        NSString *raw = @"?";
+        if (dladdr(frames[i], &info) && info.dli_fname) {
+            const char *base = strrchr(info.dli_fname, '/');
+            raw = [NSString stringWithFormat:@"%s!0x%lx", base ? base + 1 : info.dli_fname,
+                   (unsigned long)((uintptr_t)frames[i] - (uintptr_t)info.dli_fbase)];
+        }
+        [line appendFormat:@" <- %@", raw];
+    }
+    diagLog(@"%@", line);
+}
+
+//Fluid-23 one-shot dump: every zero-arg, object-returning "*ettings*" method on a
+//class chain, with the values it holds. Runs once per session from the folder zoom
+//hook so we learn every settings container the folder animator carries.
+static void folderDumpSettingsChain(id obj, const char *prefix){
+    if (!obj) return;
+    NSMutableSet *seen = [NSMutableSet new];
+    Class cls = [obj class];
+    for (int depth = 0; depth < 4 && cls; depth++) {
+        unsigned int count = 0;
+        Method *methods = class_copyMethodList(cls, &count);
+        for (unsigned int i = 0; i < count; i++) {
+            const char *name = sel_getName(method_getName(methods[i]));
+            if (!strstr(name, "ettings")) continue;
+            if (method_getNumberOfArguments(methods[i]) != 2) continue;
+            char *ret = method_copyReturnType(methods[i]);
+            BOOL isObject = ret && ret[0] == '@';
+            free(ret);
+            if (!isObject) continue;
+            NSString *key = [NSString stringWithUTF8String:name];
+            if ([seen containsObject:key]) continue;
+            [seen addObject:key];
+            SEL sel = method_getName(methods[i]);
+            if (![obj respondsToSelector:sel]) continue;
+            @try {
+                id val = ((id(*)(id, SEL))objc_msgSend)(obj, sel);
+                if (!val) { diagLogB(@"[folder-dump] %s.%s = nil", prefix, name); continue; }
+                NSMutableString *line = [NSMutableString stringWithFormat:@"[folder-dump] %s.%s = %p %@", prefix, name, val, NSStringFromClass([val class])];
+                if ([val respondsToSelector:@selector(response)]) [line appendFormat:@" response=%g", ((double(*)(id, SEL))objc_msgSend)(val, @selector(response))];
+                if ([val respondsToSelector:@selector(dampingRatio)]) [line appendFormat:@" dr=%g", ((double(*)(id, SEL))objc_msgSend)(val, @selector(dampingRatio))];
+                if ([val respondsToSelector:@selector(mass)]) [line appendFormat:@" mass=%g", ((double(*)(id, SEL))objc_msgSend)(val, @selector(mass))];
+                if ([val respondsToSelector:@selector(damping)]) [line appendFormat:@" damping=%g", ((double(*)(id, SEL))objc_msgSend)(val, @selector(damping))];
+                if ([val respondsToSelector:@selector(settlingDuration)]) [line appendFormat:@" settle=%g", ((double(*)(id, SEL))objc_msgSend)(val, @selector(settlingDuration))];
+                diagLogB(@"%@", line);
+            } @catch (NSException *e) {
+                diagLogB(@"[folder-dump] %s.%s threw %@", prefix, name, e);
+            }
+        }
+        free(methods);
+        cls = class_getSuperclass(cls);
+    }
+}
+
 //Fluid-8 unlocked-phase sampling: one line per (selector, class) pair. The flash loop
 //most likely runs on a value some controller FROZE out of a settings object while the
 //device was unlocked (same disease as the volume HUD's launch-time freeze), so we need
@@ -400,6 +471,7 @@ static void setDeviceLocked(BOOL locked, const char *source){
     if (!locked) unlockTransitionTime = CFAbsoluteTimeGetCurrent();
     diagBudget = 500; //fresh log budget per lock session
     unlockTraceBudget = 12; //fresh unlocked-read backtrace samples per session
+    folderReadTraceBudget = 90; //Fluid-23 folder read-window samples per session
     //Fluid-14: the lock pill's animation config is read INSIDE %orig of the lock call,
     //i.e. BEFORE this function used to run at the hook's tail - so every lock started
     //with the pill reading unlock-period tweaked object values and freezing them into
@@ -490,6 +562,7 @@ static void folderScaleDockValue(id obj, BOOL isResponse, double mult){
         if(isOnSpringBoard && !deviceLocked){
             diagLogClassOnce(@"get-response", self, v);
             unlockSampleTrace(@"get-response", self, v);
+            folderSampleTrace(@"get-response", self, v);
         }
         return v;
     }
@@ -498,6 +571,7 @@ static void folderScaleDockValue(id obj, BOOL isResponse, double mult){
         if(isOnSpringBoard && !deviceLocked){
             diagLogClassOnce(@"get-dampingRatio", self, v);
             unlockSampleTrace(@"get-dampingRatio", self, v);
+            folderSampleTrace(@"get-dampingRatio", self, v);
         }
         return v;
     }
@@ -506,6 +580,7 @@ static void folderScaleDockValue(id obj, BOOL isResponse, double mult){
         if(isOnSpringBoard && !deviceLocked){
             diagLogClassOnce(@"get-settlingDuration", self, v);
             unlockSampleTrace(@"get-settlingDuration", self, v);
+            folderSampleTrace(@"get-settlingDuration", self, v);
         }
         return v;
     }
@@ -781,6 +856,21 @@ static void folderScaleDockValue(id obj, BOOL isResponse, double mult){
 
 %hook SBFolderIconZoomAnimator
     - (void)_performAnimationToFraction:(double)arg1 withCentralAnimationSettings:(id)arg2 delay:(double)arg3 alreadyAnimating:(bool)arg4 sharedCompletion:(id)arg5 {
+        //Fluid-23: open the read-trace window for the animation's lifetime (the real
+        //spring may read per-frame), and once per session dump the animator's whole
+        //settings chain so the log names every container it carries.
+        static BOOL folderDumped = NO;
+        if (isOnSpringBoard && !deviceLocked) {
+            folderReadWindowUntil = CFAbsoluteTimeGetCurrent() + 2.5;
+            if (!folderDumped && folderReadTraceBudget > 0) {
+                folderDumped = YES;
+                diagLogB(@"[folder-dump] animator=%p %@", self, NSStringFromClass([self class]));
+                folderDumpSettingsChain(self, "animator");
+                id zsettings = [self respondsToSelector:@selector(settings)]
+                    ? ((id(*)(id, SEL))objc_msgSend)(self, @selector(settings)) : nil;
+                if (zsettings) folderDumpSettingsChain(zsettings, "zoomSettings");
+            }
+        }
         BOOL applied = NO;
         double savedMass = 0, savedDamping = 0;
         if (isOnSpringBoard && !deviceLocked && !bootGraceActive() && !volumeHUDActive && arg2
@@ -1056,7 +1146,7 @@ static void folderScaleDockValue(id obj, BOOL isResponse, double mult){
 		diagLogPath = @"/var/mobile/Library/SpeedsterDiag.log";
 		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring
 		diagBudget = 500; //budget for the pre-first-transition (locked after respring) session
-		diagLog(@"Speedster Fluid-22 loaded, deviceLocked(assumed)=%d", deviceLocked);
+		diagLog(@"Speedster Fluid-23 loaded, deviceLocked(assumed)=%d", deviceLocked);
 		Class lockMgrClass = objc_getClass("SBLockScreenManager");
 		if (lockMgrClass) {
 			%init(LockScreenTracker, SBLockScreenManager = lockMgrClass);
