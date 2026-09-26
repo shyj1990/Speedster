@@ -306,6 +306,18 @@ static void diagLogCore(NSString *fmt, va_list args){
     NSString *line = [NSString stringWithFormat:@"[%.3f] %@\n",
                       [NSDate date].timeIntervalSince1970, msg];
     FILE *f = fopen(diagLogPath.fileSystemRepresentation, "a");
+    if (!f && !isOnSpringBoard) {
+        //Fluid-31: sandboxed App Store apps (e.g. WeChat) cannot write
+        ///var/mobile/Library, so their injection/scale lines silently vanished.
+        //Fall back to the app's own tmp container - sandbox always allows it.
+        static NSString *fallbackPath;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            fallbackPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"SpeedsterDiag.log"];
+            diagLogPath = fallbackPath;
+        });
+        f = fopen(fallbackPath.fileSystemRepresentation, "a");
+    }
     if (f) {
         fseek(f, 0, SEEK_END);
         if (ftell(f) > 512 * 1024) { fclose(f); f = fopen(diagLogPath.fileSystemRepresentation, "w"); }
@@ -1018,11 +1030,18 @@ static void folderRestoreBSAnimSettings(id settings){
 %end
 
 //In-App animation
+//Fluid-31: re-entrancy depth for the in-app section. The field log showed double
+//scaling (UIView.animate 0.7->0.07 then the inner CAAnimation 0.07->0.007 = x100
+//instead of x10, felt "too fast"). While inside a hooked UIView animation entry's
+//%orig, the inner object-level hooks (CAAnimation/CASpringAnimation/
+//UISpringTimingParameters) skip re-scaling - the outer call already scaled.
+static NSInteger inAppUIKitDepth = 0;
+static BOOL inAppScalingSuppressed(void){ return inAppUIKitDepth > 0; }
 %hook CASpringAnimation
 
     //mass
     -(void)setMass:(double)arg1{ //in app speed
-        if(inAppAnimationEnabled && !isOnSpringBoard){
+        if(inAppAnimationEnabled && !isOnSpringBoard && !inAppScalingSuppressed()){
             double out = arg1 * reverseAppSpeedSliderValue(MassValue);
             diagLogB(@"[app-ca] mass %g->%g", arg1, out);
             %orig(out);
@@ -1032,7 +1051,7 @@ static void folderRestoreBSAnimSettings(id settings){
     }
 
     -(void)setDamping:(double)arg1{
-        if((inAppAnimationEnabled && inAppAnimationBounceEnabled) && !isOnSpringBoard && DampingValue > 0.0005){
+        if((inAppAnimationEnabled && inAppAnimationBounceEnabled) && !isOnSpringBoard && DampingValue > 0.0005 && !inAppScalingSuppressed()){
             double out = arg1 * reverseAppSpeedSliderValue(DampingValue);
             diagLogB(@"[app-ca] damping %g->%g", arg1, out);
             %orig(out);
@@ -1055,8 +1074,8 @@ static void folderRestoreBSAnimSettings(id settings){
 
     - (instancetype)initWithMass:(CGFloat)mass stiffness:(CGFloat)stiffness dampingRatio:(CGFloat)dampingRatio initialVelocity:(CGVector)velocity {
         double mult = 1.0, zeta = 1.0;
-        if (inAppAnimationEnabled && !isOnSpringBoard && MassValue > 0.0005) mult = reverseAppSpeedSliderValue(MassValue);
-        if (inAppAnimationEnabled && inAppAnimationBounceEnabled && !isOnSpringBoard && DampingValue > 0.0005) zeta = reverseAppSpeedSliderValue(DampingValue);
+        if (inAppAnimationEnabled && !isOnSpringBoard && MassValue > 0.0005 && !inAppScalingSuppressed()) mult = reverseAppSpeedSliderValue(MassValue);
+        if (inAppAnimationEnabled && inAppAnimationBounceEnabled && !isOnSpringBoard && DampingValue > 0.0005 && !inAppScalingSuppressed()) zeta = reverseAppSpeedSliderValue(DampingValue);
         if (mult >= 1.0 && zeta >= 1.0) return %orig;
         double k = stiffness / (mult * mult);
         double zr = dampingRatio * zeta;
@@ -1066,8 +1085,8 @@ static void folderRestoreBSAnimSettings(id settings){
 
     - (instancetype)initWithDampingRatio:(CGFloat)dampingRatio frequencyResponse:(CGFloat)frequencyResponse initialVelocity:(CGVector)velocity {
         double mult = 1.0, zeta = 1.0;
-        if (inAppAnimationEnabled && !isOnSpringBoard && MassValue > 0.0005) mult = reverseAppSpeedSliderValue(MassValue);
-        if (inAppAnimationEnabled && inAppAnimationBounceEnabled && !isOnSpringBoard && DampingValue > 0.0005) zeta = reverseAppSpeedSliderValue(DampingValue);
+        if (inAppAnimationEnabled && !isOnSpringBoard && MassValue > 0.0005 && !inAppScalingSuppressed()) mult = reverseAppSpeedSliderValue(MassValue);
+        if (inAppAnimationEnabled && inAppAnimationBounceEnabled && !isOnSpringBoard && DampingValue > 0.0005 && !inAppScalingSuppressed()) zeta = reverseAppSpeedSliderValue(DampingValue);
         if (mult >= 1.0 && zeta >= 1.0) return %orig;
         double f = frequencyResponse / mult;
         double zr = dampingRatio * zeta;
@@ -1077,8 +1096,8 @@ static void folderRestoreBSAnimSettings(id settings){
 
     - (instancetype)initWithDampingCoefficient:(CGFloat)dampingCoefficient mass:(CGFloat)mass stiffness:(CGFloat)stiffness initialVelocity:(CGVector)velocity {
         double mult = 1.0, zeta = 1.0;
-        if (inAppAnimationEnabled && !isOnSpringBoard && MassValue > 0.0005) mult = reverseAppSpeedSliderValue(MassValue);
-        if (inAppAnimationEnabled && inAppAnimationBounceEnabled && !isOnSpringBoard && DampingValue > 0.0005) zeta = reverseAppSpeedSliderValue(DampingValue);
+        if (inAppAnimationEnabled && !isOnSpringBoard && MassValue > 0.0005 && !inAppScalingSuppressed()) mult = reverseAppSpeedSliderValue(MassValue);
+        if (inAppAnimationEnabled && inAppAnimationBounceEnabled && !isOnSpringBoard && DampingValue > 0.0005 && !inAppScalingSuppressed()) zeta = reverseAppSpeedSliderValue(DampingValue);
         if (mult >= 1.0 && zeta >= 1.0) return %orig;
         double k = stiffness / (mult * mult);
         double c = dampingCoefficient * zeta / mult;
@@ -1096,6 +1115,10 @@ static void folderRestoreBSAnimSettings(id settings){
 //getter exceptions - the Fluid-25 failure class stays impossible by construction).
 //The same DurationMassValue slider drives springs and timed animations; mult<1 =
 //faster. In-app bounce slider scales the spring-variant's damping ratio only.
+//Fluid-31: the field log showed double-scaling (UIView.animate 0.7->0.07 then the
+//inner CAAnimation 0.07->0.007 = x100 instead of x10, "too fast"). The depth
+//counter (declared above the in-app section) marks the UIKit entry's %orig so
+//CA-level hooks skip re-scaling while inside.
 %hook UIView
 
     + (void)animateWithDuration:(double)arg1 animations:(id)arg2 {
@@ -1104,7 +1127,9 @@ static void folderRestoreBSAnimSettings(id settings){
             out = arg1 * reverseAppSpeedSliderValue(MassValue);
             diagLogB(@"[app-timed] UIView.animate %g->%g", arg1, out);
         }
+        inAppUIKitDepth++;
         %orig(out, arg2);
+        inAppUIKitDepth--;
     }
 
     + (void)animateWithDuration:(double)arg1 animations:(id)arg2 completion:(id)arg3 {
@@ -1113,7 +1138,9 @@ static void folderRestoreBSAnimSettings(id settings){
             out = arg1 * reverseAppSpeedSliderValue(MassValue);
             diagLogB(@"[app-timed] UIView.animate %g->%g", arg1, out);
         }
+        inAppUIKitDepth++;
         %orig(out, arg2, arg3);
+        inAppUIKitDepth--;
     }
 
     + (void)animateWithDuration:(double)arg1 delay:(double)arg2 options:(unsigned long long)arg3 animations:(id)arg4 completion:(id)arg5 {
@@ -1122,7 +1149,9 @@ static void folderRestoreBSAnimSettings(id settings){
             out = arg1 * reverseAppSpeedSliderValue(MassValue);
             diagLogB(@"[app-timed] UIView.animate %g->%g", arg1, out);
         }
+        inAppUIKitDepth++;
         %orig(out, arg2, arg3, arg4, arg5);
+        inAppUIKitDepth--;
     }
 
     + (void)animateWithDuration:(double)arg1 delay:(double)arg2 usingSpringWithDamping:(double)arg3 initialSpringVelocity:(double)arg4 options:(unsigned long long)arg5 animations:(id)arg6 completion:(id)arg7 {
@@ -1132,7 +1161,9 @@ static void folderRestoreBSAnimSettings(id settings){
             double out = arg1 * mult;
             double damp = arg3 * zeta;
             diagLogB(@"[app-timed] UIView.spring dur %g->%g damping %g->%g", arg1, out, arg3, damp);
+            inAppUIKitDepth++;
             %orig(out, arg2, damp, arg4, arg5, arg6, arg7);
+            inAppUIKitDepth--;
         } else {
             %orig;
         }
@@ -1144,7 +1175,9 @@ static void folderRestoreBSAnimSettings(id settings){
             out = arg1 * reverseAppSpeedSliderValue(MassValue);
             diagLogB(@"[app-timed] UIView.keyframes %g->%g", arg1, out);
         }
+        inAppUIKitDepth++;
         %orig(out, arg2, arg3, arg4, arg5);
+        inAppUIKitDepth--;
     }
 
     + (void)transitionWithView:(id)arg1 duration:(double)arg2 options:(unsigned long long)arg3 animations:(id)arg4 completion:(id)arg5 {
@@ -1153,14 +1186,16 @@ static void folderRestoreBSAnimSettings(id settings){
             out = arg2 * reverseAppSpeedSliderValue(MassValue);
             diagLogB(@"[app-timed] UIView.transition %g->%g", arg2, out);
         }
+        inAppUIKitDepth++;
         %orig(arg1, out, arg3, arg4, arg5);
+        inAppUIKitDepth--;
     }
 
 %end
 
 %hook CAAnimation
     - (void)setDuration:(double)arg1 {
-        if (inAppAnimationEnabled && !isOnSpringBoard && MassValue > 0.0005 && arg1 > 0.0001) {
+        if (inAppAnimationEnabled && !isOnSpringBoard && MassValue > 0.0005 && arg1 > 0.0001 && !inAppScalingSuppressed()) {
             double out = arg1 * reverseAppSpeedSliderValue(MassValue);
             diagLogB(@"[app-timed] CA duration %g->%g", arg1, out);
             %orig(out);
@@ -1369,9 +1404,9 @@ static void folderRestoreBSAnimSettings(id settings){
 	diagBudget = isOnSpringBoard ? 500 : 300;
 	if (isOnSpringBoard) {
 		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring (SpringBoard only)
-		diagLog(@"Speedster Fluid-30 loaded in SpringBoard, deviceLocked(assumed)=%d", deviceLocked);
+		diagLog(@"Speedster Fluid-31 loaded in SpringBoard, deviceLocked(assumed)=%d", deviceLocked);
 	} else {
-		diagLog(@"Speedster Fluid-30 injected into app process: %@", [NSBundle mainBundle].bundleIdentifier);
+		diagLog(@"Speedster Fluid-31 injected into app process: %@", [NSBundle mainBundle].bundleIdentifier);
 	}
 
 	if (isOnSpringBoard) {
