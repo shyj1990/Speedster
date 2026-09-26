@@ -151,6 +151,12 @@ static NSMapTable *stockMassValues;
 static NSLock *stockValuesLock;
 static BOOL restoringForHUD = NO;
 
+//Folder fluid settings (Fluid-21) containers - declared here because initStockMaps
+//(below) initializes them alongside the volume-restore maps.
+static NSHashTable *folderFluidObjects;       //weak refs, folder-read fluid settings
+static NSMapTable *folderFluidStockResponse;  //weak key -> NSNumber stock response
+static NSMapTable *folderFluidStockDamping;   //weak key -> NSNumber stock dampingRatio
+
 //Boot grace window: SpringBoard subsystems that freeze animation timing derived from
 //fluid settings (the volume HUD's auto-hide delay is computed once at launch from the
 //then-current response and never re-read) must see STOCK values at init, or they cache
@@ -449,10 +455,6 @@ static void startLockPolling(void){
 //The first folder open after each respring runs at stock speed (identification
 //pass); every following open is accelerated. If the system ever resets an object,
 //the next read adopts the new baseline and re-queues the scaled write.
-
-static NSHashTable *folderFluidObjects;       //weak refs, folder-read fluid settings
-static NSMapTable *folderFluidStockResponse;  //weak key -> NSNumber stock response
-static NSMapTable *folderFluidStockDamping;   //weak key -> NSNumber stock dampingRatio
 
 static BOOL folderReadSiteInBacktrace(void *frames[], int n){
     for (int i = 0; i < n; i++) {
