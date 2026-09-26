@@ -831,10 +831,15 @@ static void folderScaleBSAnimSettingsInPlace(id settings, const char *via){
     if (!settings) return;
     if (!isOnSpringBoard || deviceLocked) return;
     if (CFAbsoluteTimeGetCurrent() > folderReadWindowUntil) return;
-    if (!isFolderAnimationEnabled || FolderMassValue <= 0.0005) return;
     if (objc_getAssociatedObject(settings, folderBSScaleSavedKey)) return; //re-entrant: outer call already scaled this object
-    double mult = reverseFolderSliderValue(FolderMassValue);
-    if (mult >= 1.0) return;
+    //Fluid-27: speed and bounce are independent knobs. mult dilates time (smaller =
+    //faster); zeta scales the damping ratio (smaller = more visible bounce). The
+    //spring branch applies c*zeta/mult so each slider works alone or together.
+    double mult = 1.0;
+    if (isFolderAnimationEnabled && FolderMassValue > 0.0005) mult = reverseFolderSliderValue(FolderMassValue);
+    double zeta = 1.0;
+    if (isFolderBounceEnabled && FolderDampingValue > 0.0005) zeta = reverseFolderSliderValue(FolderDampingValue);
+    if (mult >= 1.0 && zeta >= 1.0) return;
     @try {
         NSString *cls = NSStringFromClass([settings class]);
         BOOL spring = [cls rangeOfString:@"Spring"].location != NSNotFound;
@@ -847,8 +852,8 @@ static void folderScaleBSAnimSettingsInPlace(id settings, const char *via){
             saved[@"stiffness"] = @(k);
             saved[@"damping"] = @(c);
             [(id)settings setValue:@(k / (mult * mult)) forKey:@"stiffness"];
-            [(id)settings setValue:@(c / mult) forKey:@"damping"];
-            diagLogB(@"[rev-anim] via=%s SPRING k %g->%g c %g->%g", via, k, k / (mult * mult), c, c / mult);
+            [(id)settings setValue:@(c * zeta / mult) forKey:@"damping"];
+            diagLogB(@"[rev-anim] via=%s SPRING k %g->%g c %g->%g zeta x%g", via, k, k / (mult * mult), c, c * zeta / mult, zeta);
         } else {
             double dur = 0;
             @try { dur = ((double(*)(id, SEL))objc_msgSend)(settings, @selector(duration)); } @catch (NSException *e) { return; }
@@ -1241,7 +1246,7 @@ static void folderRestoreBSAnimSettings(id settings){
 		diagLogPath = @"/var/mobile/Library/SpeedsterDiag.log";
 		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring
 		diagBudget = 500; //budget for the pre-first-transition (locked after respring) session
-		diagLog(@"Speedster Fluid-26 loaded, deviceLocked(assumed)=%d", deviceLocked);
+		diagLog(@"Speedster Fluid-27 loaded, deviceLocked(assumed)=%d", deviceLocked);
 		Class lockMgrClass = objc_getClass("SBLockScreenManager");
 		if (lockMgrClass) {
 			%init(LockScreenTracker, SBLockScreenManager = lockMgrClass);
