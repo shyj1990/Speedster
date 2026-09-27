@@ -282,7 +282,7 @@ static void restoreStockValuesForHUD(NSString *reason){
 
 static void noteVolumeHUDActivity(void){
     volumeHUDActive = YES;
-    restoreStockValuesForHUD(@"volume");
+    //Fluid-33: no restore - getter hooks return cached stock while volumeHUDActive=YES
     NSInteger generation = ++volumeHUDGeneration;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (volumeHUDGeneration == generation) volumeHUDActive = NO;
@@ -509,16 +509,13 @@ static void setDeviceLocked(BOOL locked, const char *source){
     diagLog(@"deviceLocked %d -> %d (%s)", deviceLocked, locked, source);
     deviceLocked = locked;
     if (!locked) unlockTransitionTime = CFAbsoluteTimeGetCurrent();
-    diagBudget = 500; //fresh log budget per lock session
-    unlockTraceBudget = 12; //fresh unlocked-read backtrace samples per session
-    folderReadTraceBudget = 90; //Fluid-23 folder read-window samples per session
-    //Fluid-14: the lock pill's animation config is read INSIDE %orig of the lock call,
-    //i.e. BEFORE this function used to run at the hook's tail - so every lock started
-    //with the pill reading unlock-period tweaked object values and freezing them into
-    //its own presentation state (the endless silent flash). On LOCK the restore must
-    //run BEFORE the lock machinery; the SBLockScreenManager hooks below were reordered
-    //accordingly. This function stays as the authoritative state/restore entry.
-    restoreStockValuesForHUD(locked ? @"lock" : @"unlock");
+    diagBudget = 500;
+    unlockTraceBudget = 12;
+    folderReadTraceBudget = 90;
+    //Fluid-33: NO restoreStockValuesForHUD here. Getter hooks now return CACHED
+    //stock values during sensitive windows - SpringBoard reads stock without object
+    //writes. Eliminates the Fluid-17..Fluid-32 flash root cause: synchronous mass
+    //object rewriting colliding with in-flight island pill animations.
 }
 
 static void lockCompleteDarwinCallback(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo){
@@ -597,31 +594,39 @@ static void folderScaleDockValue(id obj, BOOL isResponse, double mult){
     //exactly which controller touches a (possibly tweaked) value right before freezing
     //it. Selectors verified present in the iOS 17 SymMap dump. Perf: class-once logging
     //and an 8/session trace budget keep the hot getter path cheap.
+    //Fluid-33: stock-on-read pattern. Sensitive windows (lock/HUD/unlock-grace)
+    //return CACHED stock values from setter-populated maps - no object writes =
+    //no conflict with in-flight island pill animations. SAFETY (Fluid-18 lesson):
+    //returns CONSTANT cache values, never multiplies - per-frame reads are stable.
     -(double)response{
         double v = %orig;
-        if(isOnSpringBoard && !deviceLocked){
-            diagLogClassOnce(@"get-response", self, v);
-            unlockSampleTrace(@"get-response", self, v);
-            folderSampleTrace(@"get-response", self, v);
+        if(isOnSpringBoard){
+            if(deviceLocked || volumeHUDActive || unlockGraceActive()){
+                initStockMaps(); [stockValuesLock lock];
+                NSNumber *stock = [stockResponseValues objectForKey:self];
+                [stockValuesLock unlock];
+                if(stock) return [stock doubleValue];
+            }
+            if(!deviceLocked){ diagLogClassOnce(@"get-response", self, v); unlockSampleTrace(@"get-response", self, v); folderSampleTrace(@"get-response", self, v); }
         }
         return v;
     }
     -(double)dampingRatio{
         double v = %orig;
-        if(isOnSpringBoard && !deviceLocked){
-            diagLogClassOnce(@"get-dampingRatio", self, v);
-            unlockSampleTrace(@"get-dampingRatio", self, v);
-            folderSampleTrace(@"get-dampingRatio", self, v);
+        if(isOnSpringBoard){
+            if(deviceLocked || volumeHUDActive || unlockGraceActive()){
+                initStockMaps(); [stockValuesLock lock];
+                NSNumber *stock = [stockDampingRatioValues objectForKey:self];
+                [stockValuesLock unlock];
+                if(stock) return [stock doubleValue];
+            }
+            if(!deviceLocked){ diagLogClassOnce(@"get-dampingRatio", self, v); unlockSampleTrace(@"get-dampingRatio", self, v); folderSampleTrace(@"get-dampingRatio", self, v); }
         }
         return v;
     }
     -(double)settlingDuration{
         double v = %orig;
-        if(isOnSpringBoard && !deviceLocked){
-            diagLogClassOnce(@"get-settlingDuration", self, v);
-            unlockSampleTrace(@"get-settlingDuration", self, v);
-            folderSampleTrace(@"get-settlingDuration", self, v);
-        }
+        if(isOnSpringBoard && !deviceLocked){ diagLogClassOnce(@"get-settlingDuration", self, v); unlockSampleTrace(@"get-settlingDuration", self, v); folderSampleTrace(@"get-settlingDuration", self, v); }
         return v;
     }
 
@@ -779,6 +784,28 @@ static void folderScaleDockValue(id obj, BOOL isResponse, double mult){
 
 //Springboard speed (mostly for folder but might affect something else on springboard too)
 %hook SBFAnimationSettings
+
+    //Fluid-33: stock-on-read for legacy folder path.
+    -(double)mass{
+        double v = %orig;
+        if(isOnSpringBoard && (deviceLocked || volumeHUDActive || unlockGraceActive())){
+            initStockMaps(); [stockValuesLock lock];
+            NSNumber *stock = [stockMassValues objectForKey:self];
+            [stockValuesLock unlock];
+            if(stock) return [stock doubleValue];
+        }
+        return v;
+    }
+    -(double)damping{
+        double v = %orig;
+        if(isOnSpringBoard && (deviceLocked || volumeHUDActive || unlockGraceActive())){
+            initStockMaps(); [stockValuesLock lock];
+            NSNumber *stock = [stockDampingValues objectForKey:self];
+            [stockValuesLock unlock];
+            if(stock) return [stock doubleValue];
+        }
+        return v;
+    }
 
     -(void)setDamping:(double)arg1{
         if(restoringForHUD){ %orig; return; }
@@ -1441,12 +1468,12 @@ static BOOL inAppScalingSuppressed(void){ return inAppUIKitDepth > 0; }
 	diagBudget = isOnSpringBoard ? 500 : 300;
 	if (isOnSpringBoard) {
 		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring (SpringBoard only)
-		diagLog(@"Speedster Fluid-32 loaded in SpringBoard, deviceLocked(assumed)=%d", deviceLocked);
+		diagLog(@"Speedster Fluid-33 loaded in SpringBoard, deviceLocked(assumed)=%d", deviceLocked);
 		//Fluid-32 boot self-check: one line snapshot of install + feature state so a
 		//single respring confirms version, toggles and registry health from the log.
 		diagLog(@"[selfcheck] speed=%d slider=%lu fine=%d(%g) bounce=%d slider=%lu fine=%d(%g) | folder=%d speed=%g bounce=%d(%g) | inapp=%d speed=%g bounce=%d(%g) | switcherDismiss=%g", isSpeedEnable, (unsigned long)Speedvalue, isFineTuneSpeedEnable, FineTuneSpeedValue, isBounceEnable, (unsigned long)Bouncevalue, isFineTuneBounceEnable, FineTuneBounceValue, isFolderAnimationEnabled, FolderMassValue, isFolderAnimationBounceEnabled, FolderDampingValue, inAppAnimationEnabled, MassValue, inAppAnimationBounceEnabled, DampingValue, SwitcherDismiss);
 	} else {
-		diagLog(@"Speedster Fluid-32 injected into app process: %@", [NSBundle mainBundle].bundleIdentifier);
+		diagLog(@"Speedster Fluid-33 injected into app process: %@", [NSBundle mainBundle].bundleIdentifier);
 	}
 
 	if (isOnSpringBoard) {
