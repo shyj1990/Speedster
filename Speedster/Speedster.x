@@ -148,8 +148,34 @@ static NSMapTable *stockResponseValues;      //weak key: settings object -> NSNu
 static NSMapTable *stockDampingRatioValues;  //SBFFluidBehaviorSettings
 static NSMapTable *stockDampingValues;       //SBFAnimationSettings
 static NSMapTable *stockMassValues;
+static NSMapTable *fluidSettingsFirstSeen;   //Fresh-3: weak key -> NSNumber(first-seen timestamp) for object-age liveness verdict
 static NSLock *stockValuesLock;
 static BOOL restoringForHUD = NO;
+
+//Fresh-3 OBJECT-AGE LIVENESS (the real pill-flash root cause, finally closed):
+//Every "make it stock while locked" scheme (restore-on-lock Fluid-14..17/32,
+//getter stock-on-read Fluid-33/34) failed because the poison read happens
+//~1.3s BEFORE the lock flag flips (backlight-off prep, Fluid-15 smoking gun)
+//and again on Fluid-34 with zero writes. Conclusion: the ONLY safe state for
+//the long-lived shared SBFFluidBehaviorSettings objects is stock ALWAYS.
+//App open/close animation objects are created FRESH per animation (field
+//verified: folder dock settings pointers never repeat), while system config
+//objects (island pill, etc.) live for the whole session. So: scale ONLY
+//objects younger than FLUID_SHORTLIVED_SECS at the moment the setter fires;
+//older objects pass through 100% untouched - flash impossible by construction,
+//no getter tricks (no white ring), no restore bookkeeping needed.
+#define FLUID_SHORTLIVED_SECS 3.0
+
+static double fluidSettingsAge(id obj){
+    if (!fluidSettingsFirstSeen) initStockMaps();
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    NSNumber *seen = [fluidSettingsFirstSeen objectForKey:obj];
+    if (!seen) {
+        [fluidSettingsFirstSeen setObject:@(now) forKey:obj];
+        return 0.0;
+    }
+    return now - [seen doubleValue];
+}
 
 //Boot grace window: SpringBoard subsystems that freeze animation timing derived from
 //fluid settings (the volume HUD's auto-hide delay is computed once at launch from the
@@ -198,6 +224,7 @@ static void initStockMaps(void){
         stockDampingRatioValues = [NSMapTable mapTableWithKeyOptions:NSMapTableWeakMemory | NSMapTableObjectPointerPersonality valueOptions:NSMapTableStrongMemory];
         stockDampingValues = [NSMapTable mapTableWithKeyOptions:NSMapTableWeakMemory | NSMapTableObjectPointerPersonality valueOptions:NSMapTableStrongMemory];
         stockMassValues = [NSMapTable mapTableWithKeyOptions:NSMapTableWeakMemory | NSMapTableObjectPointerPersonality valueOptions:NSMapTableStrongMemory];
+        fluidSettingsFirstSeen = [NSMapTable mapTableWithKeyOptions:NSMapTableWeakMemory | NSMapTableObjectPointerPersonality valueOptions:NSMapTableStrongMemory];
         stockValuesLock = [NSLock new];
     });
 }
@@ -464,6 +491,15 @@ static void startLockPolling(void){
     -(void)setResponse:(double)arg1{ //App open and close speed
         if(restoringForHUD){ %orig; return; }
         if(isOnSpringBoard){
+            //Fresh-3: long-lived config objects (island pill etc.) stay stock FOREVER -
+            //scale only freshly-created per-animation objects. See FLUID_SHORTLIVED_SECS note.
+            double age = fluidSettingsAge(self);
+            if (age >= FLUID_SHORTLIVED_SECS){
+                diagLogB(@"[long-lived] setResponse %g age=%.1fs self=%p PASS-THROUGH", arg1, age, self);
+                %orig;
+                return;
+            }
+            diagLogB(@"[fluid-lifecycle] setResponse %g age=%.2fs self=%p", arg1, age, self);
             recordStockValue(stockResponseValues, self, arg1);
             diagLogClassOnce(@"setResponse", self, arg1);
             if(bootGraceActive()){
@@ -551,6 +587,14 @@ static void startLockPolling(void){
     -(void)setDampingRatio:(double)arg1{ //App open and close bouncing (volume HUD is exempted, see note above)
         if(restoringForHUD){ %orig; return; }
         if(isOnSpringBoard){
+            //Fresh-3: long-lived config objects stay stock FOREVER (see setResponse note)
+            double age = fluidSettingsAge(self);
+            if (age >= FLUID_SHORTLIVED_SECS){
+                diagLogB(@"[long-lived] setDampingRatio %g age=%.1fs self=%p PASS-THROUGH", arg1, age, self);
+                %orig;
+                return;
+            }
+            diagLogB(@"[fluid-lifecycle] setDampingRatio %g age=%.2fs self=%p", arg1, age, self);
             recordStockValue(stockDampingRatioValues, self, arg1);
             diagLogClassOnce(@"setDampingRatio", self, arg1);
             if(bootGraceActive()){
@@ -1119,7 +1163,7 @@ static void folderRestoreBSAnimSettings(id settings){
 		diagLogPath = @"/var/mobile/Library/SpeedsterDiag.log";
 		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring
 		diagBudget = 500; //budget for the pre-first-transition (locked after respring) session
-		diagLog(@"Speedster 2.2.0-Fresh-2 loaded in SpringBoard, deviceLocked(assumed)=%d", deviceLocked);
+		diagLog(@"Speedster 2.2.0-Fresh-3 loaded in SpringBoard, deviceLocked(assumed)=%d", deviceLocked);
 		//boot self-check: one line snapshot of install + feature state
 		diagLog(@"[selfcheck] speed=%d slider=%lu fine=%d(%g) bounce=%d slider=%lu fine=%d(%g) | folder=%d speed=%g bounce=%d(%g) | inapp=%d speed=%g bounce=%d(%g)",
 		        isSpeedEnable, (unsigned long)Speedvalue, isFineTuneSpeedEnable, FineTuneSpeedValue,
