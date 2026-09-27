@@ -156,7 +156,7 @@ static NSHashTable *touchedFluidResponse;
 static NSHashTable *touchedFluidDampingRatio;
 static NSHashTable *touchedAnimDamping;
 static NSHashTable *touchedAnimMass;
-static NSLock *stockValuesLock;
+static NSRecursiveLock *stockValuesLock;
 static BOOL restoringForHUD = NO;
 
 //Folder dock spring scaling (Fluid-22) containers - declared here because initStockMaps
@@ -213,7 +213,7 @@ static void initStockMaps(void){
         stockDampingRatioValues = [NSMapTable mapTableWithKeyOptions:NSMapTableWeakMemory | NSMapTableObjectPointerPersonality valueOptions:NSMapTableStrongMemory];
         stockDampingValues = [NSMapTable mapTableWithKeyOptions:NSMapTableWeakMemory | NSMapTableObjectPointerPersonality valueOptions:NSMapTableStrongMemory];
         stockMassValues = [NSMapTable mapTableWithKeyOptions:NSMapTableWeakMemory | NSMapTableObjectPointerPersonality valueOptions:NSMapTableStrongMemory];
-        stockValuesLock = [NSLock new];
+        stockValuesLock = [NSRecursiveLock new]; //Fluid-34: recursive - getter hooks may re-enter a setter-held lock on the same thread (Fluid-33 watchdog 409 self-deadlock, turnstile "blocked on self" + UUID-matched dylib frames)
         folderDockStockResponse = [NSMapTable mapTableWithKeyOptions:NSMapTableWeakMemory | NSMapTableObjectPointerPersonality valueOptions:NSMapTableStrongMemory];
         folderDockStockDamping = [NSMapTable mapTableWithKeyOptions:NSMapTableWeakMemory | NSMapTableObjectPointerPersonality valueOptions:NSMapTableStrongMemory];
         touchedFluidResponse = [NSHashTable weakObjectsHashTable];
@@ -1452,6 +1452,7 @@ static BOOL inAppScalingSuppressed(void){ return inAppUIKitDepth > 0; }
 %ctor { //More pref
     tweakLoadTime = CFAbsoluteTimeGetCurrent(); //start of the 15s boot grace window (see note above)
     isOnSpringBoard = [[[NSBundle mainBundle] bundleIdentifier] isEqual:@"com.apple.springboard"];
+    initStockMaps(); //Fluid-34: build maps+lock BEFORE any hook fires, so getter hooks never touch the dispatch_once gate (same-thread once-gate reentry = self-deadlock class)
 
     %init(_ungrouped); //activate all hooks outside explicit %groups
 
@@ -1468,12 +1469,12 @@ static BOOL inAppScalingSuppressed(void){ return inAppUIKitDepth > 0; }
 	diagBudget = isOnSpringBoard ? 500 : 300;
 	if (isOnSpringBoard) {
 		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring (SpringBoard only)
-		diagLog(@"Speedster Fluid-33 loaded in SpringBoard, deviceLocked(assumed)=%d", deviceLocked);
+		diagLog(@"Speedster Fluid-34 loaded in SpringBoard, deviceLocked(assumed)=%d", deviceLocked);
 		//Fluid-32 boot self-check: one line snapshot of install + feature state so a
 		//single respring confirms version, toggles and registry health from the log.
 		diagLog(@"[selfcheck] speed=%d slider=%lu fine=%d(%g) bounce=%d slider=%lu fine=%d(%g) | folder=%d speed=%g bounce=%d(%g) | inapp=%d speed=%g bounce=%d(%g) | switcherDismiss=%g", isSpeedEnable, (unsigned long)Speedvalue, isFineTuneSpeedEnable, FineTuneSpeedValue, isBounceEnable, (unsigned long)Bouncevalue, isFineTuneBounceEnable, FineTuneBounceValue, isFolderAnimationEnabled, FolderMassValue, isFolderAnimationBounceEnabled, FolderDampingValue, inAppAnimationEnabled, MassValue, inAppAnimationBounceEnabled, DampingValue, SwitcherDismiss);
 	} else {
-		diagLog(@"Speedster Fluid-33 injected into app process: %@", [NSBundle mainBundle].bundleIdentifier);
+		diagLog(@"Speedster Fluid-34 injected into app process: %@", [NSBundle mainBundle].bundleIdentifier);
 	}
 
 	if (isOnSpringBoard) {
