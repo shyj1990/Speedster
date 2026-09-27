@@ -166,6 +166,8 @@ static BOOL restoringForHUD = NO;
 //no getter tricks (no white ring), no restore bookkeeping needed.
 #define FLUID_SHORTLIVED_SECS 3.0
 
+static void initStockMaps(void); //forward decl (defined below)
+
 static double fluidSettingsAge(id obj){
     if (!fluidSettingsFirstSeen) initStockMaps();
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
