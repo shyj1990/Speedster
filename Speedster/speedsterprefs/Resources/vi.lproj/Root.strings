@@ -1,12 +1,9 @@
 
 
-"App Open/Close" = "App (Đóng/Mở)";
 
 
-"AppOpenCloseBounce" = "Độ nảy";
 
 
-"AppOpenCloseSpeed" = "Tốc độ mở app";
 
 
 "Buy me a Fanta" = "Mua tôi 1 lon Fanta 🥤";
@@ -15,10 +12,8 @@
 "Extra" = "Cài đặt thêm";
 
 
-"FineTuneBounce" = "Tuỳ chỉnh độ nảy bằng tay";
 
 
-"FineTuneSpeed" = "Tuỳ chỉnh tốc độ bằng tay";
 
 
 
@@ -31,13 +26,10 @@
 "Icon unlock fly in" = "Icon bay vào khi mở khóa";
 
 
-"InAppAnimation" = "Tốc độ trong app";
 
 
-"InAppDamping" = "Độ nảy";
 
 
-"InAppMass" = "Tốc độ trong app";
 
 
 
@@ -53,7 +45,6 @@
 "Respring to apply changes" = "Respring để áp dụng thay đổi";
 
 
-"SideEffect" = "*Có 1 vài tắc dụng phụ nhỏ";
 
 
 "Source code" = "Mã nguồn";

@@ -39,8 +39,7 @@ static NSArray *speedsterSliderKeys(void){
     static NSArray *keys;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        keys = @[@"FineTuneSpeedValue", @"FineTuneBounceValue", @"DurationMassValue",
-                 @"DampingValue", @"FolderMassValue", @"FolderDampingValue"];
+        keys = @[@"FolderMassValue", @"FolderDampingValue"];
     });
     return keys;
 }
@@ -168,65 +167,8 @@ static NSArray *speedsterSliderKeys(void){
 - (NSArray *)specifiers {
 	if (!_specifiers) {
 		_specifiers = [self loadSpecifiersFromPlistName:@"Root" target:self];
-    NSArray *chosenIDs = @[@"2", @"3", @"4", @"5"];
-    self.savedSpecifiers = (_savedSpecifiers) ?: [[NSMutableDictionary alloc] init];
-    for(PSSpecifier *specifier in [self specifiersForIDs:chosenIDs]) {
-     [self.savedSpecifiers setObject:specifier forKey:[specifier propertyForKey:@"id"]];
-    }
-	}    
+	}
 	return _specifiers;
-}
-
-//BIG BRAIN LINK: https://www.reddit.com/r/jailbreakdevelopers/comments/e965nj/comment/fbf2xcv/
--(void)updateSpecifierVisibility:(BOOL)animated {
-  NSDictionary *preferences = [[NSUserDefaults standardUserDefaults] persistentDomainForName:@"com.hoangdus.speedsterprefs"];
-
-  //Check if our switch is set to NO, then remove fine tune slider
-  if(![preferences[@"isFineTuneSpeedEnable"] boolValue]) {
-    [self removeSpecifier:self.savedSpecifiers[@"3"] animated:animated];
-  // If the switch is set to YES, then add back fine tune slider
-  } else if(![self containsSpecifier:self.savedSpecifiers[@"3"]]) {
-    [self insertSpecifier:self.savedSpecifiers[@"3"] atIndex:4 animated:animated];
-  }
-
-  //Check if our switch is set to YES, then remove preset
-  if([preferences[@"isFineTuneSpeedEnable"] boolValue]) {
-    [self removeSpecifier:self.savedSpecifiers[@"2"] animated:animated];
-  // If the switch is set to NO, add back the preset
-  } else if(![self containsSpecifier:self.savedSpecifiers[@"2"]]) {
-    [self insertSpecifier:self.savedSpecifiers[@"2"] atIndex:4 animated:animated];
-  }
-
-  //Check if our switch is set to NO, then remove fine tune slider
-  if(![preferences[@"isFineTuneBounceEnable"] boolValue]) {
-    [self removeSpecifier:self.savedSpecifiers[@"5"] animated:animated];
-  // If the switch is set to YES, then add back fine tune slider
-  } else if(![self containsSpecifier:self.savedSpecifiers[@"5"]]) {
-    [self insertSpecifier:self.savedSpecifiers[@"5"] atIndex:7 animated:animated];
-  }
-
-  //Check if our switch is set to YES, then remove preset
-  if([preferences[@"isFineTuneBounceEnable"] boolValue]) {
-    [self removeSpecifier:self.savedSpecifiers[@"4"] animated:animated];
-  // If the switch is set to NO, add back the preset
-  } else if(![self containsSpecifier:self.savedSpecifiers[@"4"]]) {
-    [self insertSpecifier:self.savedSpecifiers[@"4"] atIndex:7 animated:animated];
-  }
-}
-
--(void)reloadSpecifiers {
-  [super reloadSpecifiers];
-  [self updateSpecifierVisibility:NO];
-}
-
--(void)setPreferenceValue:(id)value specifier:(PSSpecifier *)specifier {
-  [super setPreferenceValue:value specifier:specifier];
-  [self updateSpecifierVisibility:YES];
-}
-
--(void)viewDidLoad {
-  [super viewDidLoad];
-  [self updateSpecifierVisibility:NO];
 }
 
 //---- Percentage input field on every slider row -----------------------------

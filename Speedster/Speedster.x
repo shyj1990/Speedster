@@ -2,53 +2,41 @@
 #import <dispatch/dispatch.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
-#import <execinfo.h>
-#import <dlfcn.h>
 #import <stdio.h>
 #import <stdarg.h>
+
+//2.2.0-Fresh-1: ground-up rebuild on the Fluid-17 clean baseline.
+//ONLY feature kept from the Fluid-18..34 era: folder open/close speed + bounce
+//(the Fluid-22..27 write-side mechanism, field-verified stable). Everything that
+//ever touched the lock screen / Dynamic Island is GONE by construction:
+//  - no app open/close animation  -> no SBFFluidBehaviorSettings setter scaling
+//  - no in-app animation          -> no CASpringAnimation/UIView/CAAnimation hooks
+//  - no wake/sleep speed          -> no SBFWakeAnimationSettings hooks (retired Fluid-16)
+//  - no stock-restore registry    -> no restoreStockValuesForHUD (the root cause of
+//                                    BOTH the lock-pill flashing saga AND the
+//                                    Fluid-33/34 white-ring regression)
+//  - no getter hooks at all       -> getter multiplication stays BANNED (Fluid-18
+//                                    watchdog freeze), and no getter can leak a
+//                                    scaled value into the lock pill (Fluid-35 lesson)
+//The tweak now writes ONLY per-animation objects that are created fresh and die
+//with the animation, so lock-screen state can never be contaminated.
+
 static BOOL isOnSpringBoard;
-// -1 means "don't touch the system value". Starting at 0.0 would make
-// emptySwitcherDismissDelay return a 0s delay before setResponse: ever runs,
-// causing the switcher animation to be recomputed constantly (high CPU on iOS 17).
-static double SwitcherDismiss = -1;
 
-static BOOL isSpeedEnable;
-static BOOL isBounceEnable;
-static int Speedvalue;
-static int Bouncevalue;
-static BOOL isFineTuneSpeedEnable;
-static BOOL isFineTuneBounceEnable;
-static double FineTuneSpeedValue;
-static double FineTuneBounceValue;
-
+//Folder open/close animation (the only speed feature in the Fresh rebuild)
 static BOOL isFolderAnimationEnabled;
 static BOOL isFolderAnimationBounceEnabled;
 static double FolderMassValue;
 static double FolderDampingValue;
 
-static BOOL inAppAnimationEnabled;
-static BOOL inAppAnimationBounceEnabled;
-static double MassValue;
-static double DampingValue;
-
+//Extra toggles (unchanged from the original tweak)
 static BOOL isNoiconflyEnable;
 static BOOL isNoiconshakingEnable;
 static BOOL isNoiconZoominSwitcher;
 static BOOL isNoWallZoominSwitcher;
-static BOOL isInstantFolder;
 
-void preferencesthings(){ //pref starts to look THICC
+void preferencesthings(){
     NSDictionary *prefs = [[NSUserDefaults standardUserDefaults] persistentDomainForName:@"com.hoangdus.speedsterprefs"];
-
-    //app close/open values
-    isSpeedEnable = (prefs && [prefs objectForKey:@"isSpeedEnable"] ? [[prefs valueForKey:@"isSpeedEnable"] boolValue] : NO );
-    isBounceEnable = (prefs && [prefs objectForKey:@"isBounceEnable"] ? [[prefs valueForKey:@"isBounceEnable"] boolValue] : NO );
-    Speedvalue = (prefs && [prefs objectForKey:@"Speedvalue"] ? [[prefs valueForKey:@"Speedvalue"] integerValue] : 1 );
-    Bouncevalue = (prefs && [prefs objectForKey:@"Bouncevalue"] ? [[prefs valueForKey:@"Bouncevalue"] integerValue] : 1 );
-    isFineTuneSpeedEnable = (prefs && [prefs objectForKey:@"isFineTuneSpeedEnable"] ? [[prefs valueForKey:@"isFineTuneSpeedEnable"] boolValue] : NO );
-    isFineTuneBounceEnable = (prefs && [prefs objectForKey:@"isFineTuneBounceEnable"] ? [[prefs valueForKey:@"isFineTuneBounceEnable"] boolValue] : NO );
-    FineTuneSpeedValue = (prefs && [prefs objectForKey:@"FineTuneSpeedValue"] ? [[prefs valueForKey:@"FineTuneSpeedValue"] doubleValue] : 1 );
-    FineTuneBounceValue = (prefs && [prefs objectForKey:@"FineTuneBounceValue"] ? [[prefs valueForKey:@"FineTuneBounceValue"] doubleValue] : 1 );
 
     //folder values
     isFolderAnimationEnabled = (prefs && [prefs objectForKey:@"isFolderAnimationEnabled"] ? [[prefs valueForKey:@"isFolderAnimationEnabled"] boolValue] : NO );
@@ -61,272 +49,24 @@ void preferencesthings(){ //pref starts to look THICC
     isNoiconZoominSwitcher = (prefs && [prefs objectForKey:@"nozoom"] ? [[prefs valueForKey:@"nozoom"] boolValue] : NO );
     isNoWallZoominSwitcher = (prefs && [prefs objectForKey:@"noWPzoom"] ? [[prefs valueForKey:@"noWPzoom"] boolValue] : NO );
     isNoiconshakingEnable = (prefs && [prefs objectForKey:@"noshaking"] ? [[prefs valueForKey:@"noshaking"] boolValue] : NO );
-    isInstantFolder = (prefs && [prefs objectForKey:@"InstantFolder"] ? [[prefs valueForKey:@"InstantFolder"] boolValue] : NO );
-}
-
-void inAppSpeedPreferences(){
-    NSDictionary *prefs = [[NSUserDefaults standardUserDefaults] persistentDomainForName:@"com.hoangdus.speedsterprefs"];
-
-    //in-app values
-    inAppAnimationEnabled = (prefs && [prefs objectForKey:@"InAppAnimationEnabled"] ? [[prefs valueForKey:@"InAppAnimationEnabled"] boolValue] : NO );
-    inAppAnimationBounceEnabled = (prefs && [prefs objectForKey:@"isInAppBounceEnabled"] ? [[prefs valueForKey:@"isInAppBounceEnabled"] boolValue] : NO );
-    DampingValue = (prefs && [prefs objectForKey:@"DampingValue"] ? [[prefs valueForKey:@"DampingValue"] doubleValue] : 0 );
-    MassValue = (prefs && [prefs objectForKey:@"DurationMassValue"] ? [[prefs valueForKey:@"DurationMassValue"] doubleValue] : 0 );
 }
 
 static void preferencesChanged(){ //runs at load and every time the prefs darwin notification fires
     preferencesthings();
-    inAppSpeedPreferences();
 }
 
-//reverse number to make sliders go from left to right lol
-//
-//All spring-related mappings below are EXPONENTIAL (not linear): perceived
-//speed follows a logarithmic curve, so a linear track made one 1% step at the
-//fast end change the animation 3-7x more than the same step at the slow end.
-//With a constant-ratio curve, 1% of the track feels the same everywhere.
-//NOTE: saved slider values shift meaning once (re-set your sliders after update).
-static double reverseSpeedSliderValue(double input){ //track 0.05..0.40 -> response 0.45..0.15
-    double f = (input - 0.05) / 0.35; //0 = slowest end, 1 = fastest end
-    f = MIN(MAX(f, 0.0), 1.0);
-    //Per user preference: 0% = exactly stock (~0.45), and the fast end is capped
-    //at 0.15 (3x stock) instead of the original 0.05 (9x). 3x total range ->
-    //constant ~1.1% duration change per 1% of track (very fine-grained).
-    return 0.45 * pow(0.3333, f);
-}
-
-static double reverseBounceSliderValue(double input){ //track 0.2..1.0 -> dampingRatio 0.9..0.2
-    double f = (input - 0.2) / 0.8;
-    f = MIN(MAX(f, 0.0), 1.0);
-    //0% = stock feel (dampingRatio ~0.9, no extra bounce); bouncy end capped at
-    //0.2 (the most bouncy preset) instead of the original 0.1 (endless wobble).
-    return 0.9 * pow(0.2222, f);
-}
-
-static double reverseAppSpeedSliderValue(double input){ //track 0..0.99 -> stock multiplier 1.0..0.1
-    double f = input / 0.99;
-    f = MIN(MAX(f, 0.0), 1.0);
-    //0% = exactly stock (x1.0); fast end capped at x0.1 (springs ~3.2x faster,
-    //matching the app open/close 3x cap philosophy).
-    double value = pow(0.1, f);
-    //Floor the multiplier: values below 0.1 make CASpringAnimation parameters
-    //pathological (tiny mass/damping), which on iOS 17 + ProMotion (120Hz)
-    //keeps springs recomputing frames and burns CPU.
-    if (value < 0.1) {
-        value = 0.1;
-    }
-    return value;
-}
-
+//Folder slider mapping: perceptual (exponential) curve, 0% = exactly stock,
+//fast end capped at 0.1 (same constant-ratio philosophy as the old speed sliders).
 static double reverseFolderSliderValue(double input){ //track 0..0.9 -> stock multiplier 1.0..0.1
     double f = input / 0.9;
     f = MIN(MAX(f, 0.0), 1.0);
-    return pow(0.1, f); //0% = exactly stock, fast end capped, same as in-app
+    return pow(0.1, f); //0% = exactly stock, fast end capped
 }
 
-
-//Volume HUD exemption ---------------------------------------------------------------
-//The stock volume HUD animates with the same SBFFluidBehaviorSettings that the app
-//open/close hooks modify, so it inherited the tweaked speed (it disappeared
-//abnormally fast). SpringBoard announces every volume change right before the HUD
-//(re)shows, and the HUD's show+hide animations are all configured within a couple
-//of seconds after that, so fluid settings touched during this short "active"
-//window belong to the volume HUD and must pass through unmodified.
-static NSInteger volumeHUDGeneration = 0;
-static BOOL volumeHUDActive = NO;
-
-//------------------------------------------------------------------------------------
-
-//Root cause found via 2.1.6 log evidence: the volume HUD reads fluid settings objects
-//whose setters are NEVER called during the volume event (vcStack=0 for every call), so
-//it animates with whatever value those objects carried from an earlier (tweaked)
-//configuration - the exemption window alone can never help. Fix: remember the original
-//(caller-requested) value of every settings object we touch, and on each volume event
-//restore those stock values into the live objects before the HUD reads them. The next
-//app animation re-configures its own objects and gets tweaked values as usual.
-static NSMapTable *stockResponseValues;      //weak key: settings object -> NSNumber (caller-requested response)
-static NSMapTable *stockDampingRatioValues;  //SBFFluidBehaviorSettings
-static NSMapTable *stockDampingValues;       //SBFAnimationSettings
-static NSMapTable *stockMassValues;
-//Fluid-32: restore used to rewrite EVERY registered object (282+ by Fluid-31) at
-//lock/unlock/HUD - pure no-op churn for objects the system itself set, and each
-//write fires the setter on objects that may be mid-animation (island pill flash
-//suspect). Track only objects we actually scaled; restore touches just those.
-static NSHashTable *touchedFluidResponse;
-static NSHashTable *touchedFluidDampingRatio;
-static NSHashTable *touchedAnimDamping;
-static NSHashTable *touchedAnimMass;
-static NSRecursiveLock *stockValuesLock;
-static BOOL restoringForHUD = NO;
-
-//Folder dock spring scaling (Fluid-22) containers - declared here because initStockMaps
-//(below) initializes them alongside the volume-restore maps.
-static NSMapTable *folderDockStockResponse;   //weak key -> NSNumber stock response
-static NSMapTable *folderDockStockDamping;    //weak key -> NSNumber stock dampingRatio
-
-//Boot grace window: SpringBoard subsystems that freeze animation timing derived from
-//fluid settings (the volume HUD's auto-hide delay is computed once at launch from the
-//then-current response and never re-read) must see STOCK values at init, or they cache
-//a poisoned copy that no amount of restoring can reach. No rewriting while the grace is
-//active; the only cost is that app animations right after a respring run at stock speed.
-//The grace ends 1s after applicationDidFinishLaunching returns: the v2.1.4-4 diagnosis
-//proved all freeze reads happen synchronously inside that method. Floors: 2.5s absolute
-//(the burst starts ~2s after load), 15s ceiling fallback if the launch signal never fires.
-static CFAbsoluteTime tweakLoadTime = 0;
-static CFAbsoluteTime springBoardDidFinishLaunchingTime = 0;
-static BOOL bootGraceArmed = NO;
-
-static BOOL bootGraceActive(void){
-    if (!isOnSpringBoard || bootGraceArmed) return NO;
-    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if ((now - tweakLoadTime) < 2.5) return YES; //absolute floor: burst starts ~2s after load
-    //Device-verified (v2.1.4-4/-5 logs): every freeze read happens synchronously INSIDE
-    //applicationDidFinishLaunching (+1s..+3s, via PrototypeTools), so ending the grace
-    //1s after that method returns covers them deterministically (~3.6s total on A17).
-    if (springBoardDidFinishLaunchingTime != 0) {
-        if ((now - springBoardDidFinishLaunchingTime) < 1.0) return YES; //launch just completed
-        bootGraceArmed = YES;
-        return NO;
-    }
-    if ((now - tweakLoadTime) > 15.0) { //fallback if the launch signal never fired
-        bootGraceArmed = YES;
-        return NO;
-    }
-    return YES;
-}
-
-//Silence the compiler for restore calls: the hooked setters exist at runtime on the
-//recorded objects, but the compiler only knows them from the %hook context.
-@interface NSObject (SpeedsterFluidSettings)
-- (void)setResponse:(double)arg1;
-- (void)setDampingRatio:(double)arg1;
-- (void)setDamping:(double)arg1;
-- (void)setMass:(double)arg1;
-- (double)damping;
-- (double)mass;
-@end
-
-static void initStockMaps(void){
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        stockResponseValues = [NSMapTable mapTableWithKeyOptions:NSMapTableWeakMemory | NSMapTableObjectPointerPersonality valueOptions:NSMapTableStrongMemory];
-        stockDampingRatioValues = [NSMapTable mapTableWithKeyOptions:NSMapTableWeakMemory | NSMapTableObjectPointerPersonality valueOptions:NSMapTableStrongMemory];
-        stockDampingValues = [NSMapTable mapTableWithKeyOptions:NSMapTableWeakMemory | NSMapTableObjectPointerPersonality valueOptions:NSMapTableStrongMemory];
-        stockMassValues = [NSMapTable mapTableWithKeyOptions:NSMapTableWeakMemory | NSMapTableObjectPointerPersonality valueOptions:NSMapTableStrongMemory];
-        stockValuesLock = [NSRecursiveLock new]; //Fluid-34: recursive - getter hooks may re-enter a setter-held lock on the same thread (Fluid-33 watchdog 409 self-deadlock, turnstile "blocked on self" + UUID-matched dylib frames)
-        folderDockStockResponse = [NSMapTable mapTableWithKeyOptions:NSMapTableWeakMemory | NSMapTableObjectPointerPersonality valueOptions:NSMapTableStrongMemory];
-        folderDockStockDamping = [NSMapTable mapTableWithKeyOptions:NSMapTableWeakMemory | NSMapTableObjectPointerPersonality valueOptions:NSMapTableStrongMemory];
-        touchedFluidResponse = [NSHashTable weakObjectsHashTable];
-        touchedFluidDampingRatio = [NSHashTable weakObjectsHashTable];
-        touchedAnimDamping = [NSHashTable weakObjectsHashTable];
-        touchedAnimMass = [NSHashTable weakObjectsHashTable];
-    });
-}
-
-//Diag logging lives below (lock exemption section); forward-declared because the
-//stock-restore above logs its map sizes too.
-static void diagLog(NSString *fmt, ...);
-static void diagLogB(NSString *fmt, ...);
-
-static void recordStockValue(NSMapTable *map, id object, double value){
-    if (!isOnSpringBoard) return;
-    initStockMaps();
-    [stockValuesLock lock];
-    [map setObject:@(value) forKey:object];
-    [stockValuesLock unlock];
-}
-
-static void markTouched(NSHashTable *table, id object){
-    if (!isOnSpringBoard) return;
-    initStockMaps();
-    [stockValuesLock lock];
-    [table addObject:object];
-    [stockValuesLock unlock];
-}
-
-__attribute__((unused)) static void restoreStockValuesForHUD(NSString *reason){
-    if (!isOnSpringBoard) return;
-    initStockMaps();
-    [stockValuesLock lock];
-    diagLog(@"restore(%@): touched response=%lu dr=%lu damping=%lu mass=%lu (registered %lu/%lu/%lu/%lu)", reason,
-            (unsigned long)[touchedFluidResponse count], (unsigned long)[touchedFluidDampingRatio count],
-            (unsigned long)[touchedAnimDamping count], (unsigned long)[touchedAnimMass count],
-            (unsigned long)[stockResponseValues count], (unsigned long)[stockDampingRatioValues count],
-            (unsigned long)[stockDampingValues count], (unsigned long)[stockMassValues count]);
-    restoringForHUD = YES; //hooks pass straight through to %orig while restoring
-    //Fluid-32: iterate the touched set, not the full registry - an object the
-    //system set itself carries its own stock value and must not be rewritten.
-    for (id obj in touchedFluidResponse) {
-        NSNumber *v = [stockResponseValues objectForKey:obj];
-        if (v) [(id)obj setResponse:[v doubleValue]];
-    }
-    for (id obj in touchedFluidDampingRatio) {
-        NSNumber *v = [stockDampingRatioValues objectForKey:obj];
-        if (v) [(id)obj setDampingRatio:[v doubleValue]];
-    }
-    for (id obj in touchedAnimDamping) {
-        NSNumber *v = [stockDampingValues objectForKey:obj];
-        if (v) [(id)obj setDamping:[v doubleValue]];
-    }
-    for (id obj in touchedAnimMass) {
-        NSNumber *v = [stockMassValues objectForKey:obj];
-        if (v) [(id)obj setMass:[v doubleValue]];
-    }
-    [touchedFluidResponse removeAllObjects];
-    [touchedFluidDampingRatio removeAllObjects];
-    [touchedAnimDamping removeAllObjects];
-    [touchedAnimMass removeAllObjects];
-    restoringForHUD = NO;
-    [stockValuesLock unlock];
-}
-
-static void noteVolumeHUDActivity(void){
-    volumeHUDActive = YES;
-    //Fluid-33: no restore - getter hooks return cached stock while volumeHUDActive=YES
-    NSInteger generation = ++volumeHUDGeneration;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if (volumeHUDGeneration == generation) volumeHUDActive = NO;
-    });
-}
-
-//Lock screen exemption ---------------------------------------------------------------
-//v2.1.4-Fluid-6 failed on device: the lock pill kept flashing and its frequency tracked
-//the app open/close slider, i.e. the exemptions never engaged. Both legacy lock signals
-//are dead on iOS 17: "com.apple.springboard.lockcomplete" doesn't fire and the lockstate
-//notify payload reads 0 in both directions, so deviceLocked stayed NO and every exemption
-//branch was skipped (behavior identical to Fluid-5).
-//v2.1.4-Fluid-7 reads lock state from the class that OWNS it (verified against the iOS 17
-//SpringBoard runtime dump): SBLockScreenManager.sharedInstance.isUILocked, via three
-//redundant channels - (1) direct hooks on _setUILocked:/_reallySetUILocked: (instant),
-//(2) a 0.5s authoritative poll (converges even if hooks/notifications ever fail), and
-//(3) the lockcomplete darwin notification as a bonus. On change we also run the
-//volume-HUD-style stock restore so the lock pill reads clean fluid settings objects.
-//Fluid-7 device result: lock tracking + stock pass-through all WORK (log-verified), yet
-//the pill still flashes. The 40-line log budget was consumed entirely by the ~40-line
-//wake burst, so the loop's own calls (if any) were invisible. Fluid-8 is a
-//diagnostics-first build, no behavior change: 500-line budget, class names on every
-//line, unlocked-phase per-class sampling (frozen-copy hunt), locked-phase logging of
-//the wake getters (the only values still tweaked while locked), and a 10s heartbeat
-//that proves silence during the flash is real.
-//Diag logging (this build only): /var/mobile/Library/SpeedsterDiag.log, fresh per
-//respring, budgeted while locked so it can never spam per-frame.
-static volatile BOOL deviceLocked = YES; //SpringBoard always launches into the lock screen
-static dispatch_source_t lockPollTimer;
+//Diagnostics: budgeted append-only log, fresh per respring. Kept (slimmed) from
+//the Fluid series: it never caused harm and makes any future regression diagnosable.
 static NSString *diagLogPath = nil;
 static NSInteger diagBudget = 0;
-
-//Fluid-14 unlock grace: for a short window right after the unlock transition completes,
-//keep every SpringBoard-facing hook at stock. The lock pill collapses during the unlock
-//transition and may (re)configure its presentation settings just after the state flips;
-//any tweaked value it picks up there gets frozen into its own state and replays as the
-//endless silent flash on the next lock. Cost: app animations in the first 0.6s after
-//unlock run at stock speed (barely noticeable, the unlock flow lands on the home screen).
-static CFAbsoluteTime unlockTransitionTime = 0;
-static BOOL unlockGraceActive(void){
-    if (!isOnSpringBoard || deviceLocked) return NO;
-    if (unlockTransitionTime == 0) return NO;
-    return (CFAbsoluteTimeGetCurrent() - unlockTransitionTime) < 0.6;
-}
 
 static void diagLogCore(NSString *fmt, va_list args){
     if (!diagLogPath) return;
@@ -334,18 +74,6 @@ static void diagLogCore(NSString *fmt, va_list args){
     NSString *line = [NSString stringWithFormat:@"[%.3f] %@\n",
                       [NSDate date].timeIntervalSince1970, msg];
     FILE *f = fopen(diagLogPath.fileSystemRepresentation, "a");
-    if (!f && !isOnSpringBoard) {
-        //Fluid-31: sandboxed App Store apps (e.g. WeChat) cannot write
-        ///var/mobile/Library, so their injection/scale lines silently vanished.
-        //Fall back to the app's own tmp container - sandbox always allows it.
-        static NSString *fallbackPath;
-        static dispatch_once_t once;
-        dispatch_once(&once, ^{
-            fallbackPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"SpeedsterDiag.log"];
-            diagLogPath = fallbackPath;
-        });
-        f = fopen(fallbackPath.fileSystemRepresentation, "a");
-    }
     if (f) {
         fseek(f, 0, SEEK_END);
         if (ftell(f) > 512 * 1024) { fclose(f); f = fopen(diagLogPath.fileSystemRepresentation, "w"); }
@@ -359,11 +87,7 @@ static void diagLog(NSString *fmt, ...){
     va_end(args);
 }
 
-//Budgeted variant for potentially chatty call sites (500 lines per lock session max).
-//Fluid-7 lesson: the 40-line budget was eaten by the ~40-line wake burst alone, so
-//everything the flash loop did AFTER the burst went unlogged and silence during the
-//flash was indistinguishable from budget starvation.
-static void diagLogB(NSString *fmt, ...){
+static void diagLogB(NSString *fmt, ...){ //budgeted variant for chatty call sites
     if (diagBudget <= 0) return;
     diagBudget--;
     va_list args; va_start(args, fmt);
@@ -371,130 +95,13 @@ static void diagLogB(NSString *fmt, ...){
     va_end(args);
 }
 
-//Fluid-15 unlocked-phase read sampling. While locked every hooked path provably
-//returns stock, yet the pill keeps flashing - so the poison must be a value the
-//pill's controllers captured while UNLOCKED into their own storage (settings-object
-//restore can never reach a private copy). Unlocked-phase calls of the suspects were
-//invisible in every previous log (diagLogB only fires while locked). This samples
-//the first N unlocked reads of each suspect with raw image!offset backtraces.
-//NOTE: backtraces taken from inside our hooks are polluted by every installed
-//tweak's hook trampoline frames (Fluid-14 SymMap analysis proved the "SpringBoard"
-//frames in storm traces are trampolines), but who-calls-whom is still readable.
-static NSInteger unlockTraceBudget = 0;
-static volatile BOOL speedsterInternalProbe = NO; //suppress sampling while the tweak itself reads values for diagnostics
-static void unlockSampleTrace(NSString *tag, id obj, double value){
-    if (!isOnSpringBoard || deviceLocked || speedsterInternalProbe || unlockTraceBudget <= 0) return;
-    unlockTraceBudget--;
-    void *frames[32] = {0};
-    int n = backtrace(frames, 32);
-    NSMutableString *line = [NSMutableString stringWithFormat:@"[unlock-read] %@ value=%g obj=%p %@ (%d frames):", tag, value, obj, NSStringFromClass([obj class]), n];
-    for (int i = 2; i < n && i < 16; i++) {
-        Dl_info info;
-        memset(&info, 0, sizeof(info));
-        NSString *raw = @"?";
-        if (dladdr(frames[i], &info) && info.dli_fname) {
-            const char *base = strrchr(info.dli_fname, '/');
-            raw = [NSString stringWithFormat:@"%s!0x%lx", base ? base + 1 : info.dli_fname,
-                   (unsigned long)((uintptr_t)frames[i] - (uintptr_t)info.dli_fbase)];
-        }
-        [line appendFormat:@" <- %@", raw];
-    }
-    diagLog(@"%@", line);
-}
-
-//Fluid-23 folder read-window tracing. Fluid-22 proved writing the dockAnimation-
-//Settings object right before %orig has NO visual effect, so the real zoom spring
-//reads its parameters somewhere else (or snapshots them earlier). From the moment
-//the folder zoom hook fires, sample every unlocked response/dampingRatio read for
-//~2.5s with raw image!offset backtraces - the log will show exactly which object
-//and which call sites feed the actual folder spring.
-static CFAbsoluteTime folderReadWindowUntil = 0;
-static NSInteger folderReadTraceBudget = 0;
-static void folderSampleTrace(NSString *tag, id obj, double value){
-    if (!isOnSpringBoard || deviceLocked || speedsterInternalProbe || folderReadTraceBudget <= 0) return;
-    if (CFAbsoluteTimeGetCurrent() > folderReadWindowUntil) return;
-    folderReadTraceBudget--;
-    void *frames[32] = {0};
-    int n = backtrace(frames, 32);
-    NSMutableString *line = [NSMutableString stringWithFormat:@"[folder-read] %@ value=%g obj=%p %@ (%d frames):", tag, value, obj, NSStringFromClass([obj class]), n];
-    for (int i = 2; i < n && i < 16; i++) {
-        Dl_info info;
-        memset(&info, 0, sizeof(info));
-        NSString *raw = @"?";
-        if (dladdr(frames[i], &info) && info.dli_fname) {
-            const char *base = strrchr(info.dli_fname, '/');
-            raw = [NSString stringWithFormat:@"%s!0x%lx", base ? base + 1 : info.dli_fname,
-                   (unsigned long)((uintptr_t)frames[i] - (uintptr_t)info.dli_fbase)];
-        }
-        [line appendFormat:@" <- %@", raw];
-    }
-    diagLog(@"%@", line);
-}
-
-//Fluid-23 one-shot dump: every zero-arg, object-returning "*ettings*" method on a
-//class chain, with the values it holds. Runs once per session from the folder zoom
-//hook so we learn every settings container the folder animator carries.
-static void folderDumpSettingsChain(id obj, const char *prefix){
-    if (!obj) return;
-    NSMutableSet *seen = [NSMutableSet new];
-    Class cls = [obj class];
-    for (int depth = 0; depth < 4 && cls; depth++) {
-        unsigned int count = 0;
-        Method *methods = class_copyMethodList(cls, &count);
-        for (unsigned int i = 0; i < count; i++) {
-            const char *name = sel_getName(method_getName(methods[i]));
-            if (!strstr(name, "ettings")) continue;
-            if (method_getNumberOfArguments(methods[i]) != 2) continue;
-            char *ret = method_copyReturnType(methods[i]);
-            BOOL isObject = ret && ret[0] == '@';
-            free(ret);
-            if (!isObject) continue;
-            NSString *key = [NSString stringWithUTF8String:name];
-            if ([seen containsObject:key]) continue;
-            [seen addObject:key];
-            SEL sel = method_getName(methods[i]);
-            if (![obj respondsToSelector:sel]) continue;
-            @try {
-                id val = ((id(*)(id, SEL))objc_msgSend)(obj, sel);
-                if (!val) { diagLogB(@"[folder-dump] %s.%s = nil", prefix, name); continue; }
-                NSMutableString *line = [NSMutableString stringWithFormat:@"[folder-dump] %s.%s = %p %@", prefix, name, val, NSStringFromClass([val class])];
-                if ([val respondsToSelector:@selector(response)]) [line appendFormat:@" response=%g", ((double(*)(id, SEL))objc_msgSend)(val, @selector(response))];
-                if ([val respondsToSelector:@selector(dampingRatio)]) [line appendFormat:@" dr=%g", ((double(*)(id, SEL))objc_msgSend)(val, @selector(dampingRatio))];
-                if ([val respondsToSelector:@selector(mass)]) [line appendFormat:@" mass=%g", ((double(*)(id, SEL))objc_msgSend)(val, @selector(mass))];
-                if ([val respondsToSelector:@selector(damping)]) [line appendFormat:@" damping=%g", ((double(*)(id, SEL))objc_msgSend)(val, @selector(damping))];
-                if ([val respondsToSelector:@selector(settlingDuration)]) [line appendFormat:@" settle=%g", ((double(*)(id, SEL))objc_msgSend)(val, @selector(settlingDuration))];
-                diagLogB(@"%@", line);
-            } @catch (NSException *e) {
-                diagLogB(@"[folder-dump] %s.%s threw %@", prefix, name, e);
-            }
-        }
-        free(methods);
-        cls = class_getSuperclass(cls);
-    }
-}
-
-//Fluid-8 unlocked-phase sampling: one line per (selector, class) pair. The flash loop
-//most likely runs on a value some controller FROZE out of a settings object while the
-//device was unlocked (same disease as the volume HUD's launch-time freeze), so we need
-//to know every class that flows through the hooked setters during normal use.
-//Instances are created per-animation, so the class name is the only stable identity.
-static NSMutableSet *diagUniqueLogged;
-static void diagLogClassOnce(NSString *tag, id obj, double value){
-    if (!isOnSpringBoard || !obj || deviceLocked) return;
-    if (diagUniqueLogged && diagUniqueLogged.count >= 64) return; //saturated: skip the per-call string alloc + lock
-    initStockMaps();
-    NSString *className = NSStringFromClass([obj class]);
-    NSString *key = [NSString stringWithFormat:@"%@|%@", tag, className];
-    BOOL shouldLog = NO;
-    [stockValuesLock lock];
-    if (!diagUniqueLogged) diagUniqueLogged = [NSMutableSet new];
-    if ([diagUniqueLogged count] < 64 && ![diagUniqueLogged containsObject:key]) {
-        [diagUniqueLogged addObject:key];
-        shouldLog = YES;
-    }
-    [stockValuesLock unlock];
-    if (shouldLog) diagLog(@"[unlocked] %@ on %@ value=%g", tag, className, value);
-}
+//Lock state tracking ----------------------------------------------------------
+//The lock flag only GATES the folder scaling hooks (a folder cannot be opened
+//while locked; the gate is cheap belt-and-braces so lock-screen animations are
+//guaranteed stock by construction). There is deliberately NO restore machinery
+//here: with zero long-lived object writes there is nothing to restore.
+static volatile BOOL deviceLocked = YES; //SpringBoard always launches into the lock screen
+static dispatch_source_t lockPollTimer;
 
 static BOOL queryUILocked(void){
     Class cls = objc_getClass("SBLockScreenManager");
@@ -506,16 +113,9 @@ static BOOL queryUILocked(void){
 
 static void setDeviceLocked(BOOL locked, const char *source){
     if (locked == deviceLocked) return;
-    diagLog(@"deviceLocked %d -> %d (%s)", deviceLocked, locked, source);
+    int old = deviceLocked;
     deviceLocked = locked;
-    if (!locked) unlockTransitionTime = CFAbsoluteTimeGetCurrent();
-    diagBudget = 500;
-    unlockTraceBudget = 12;
-    folderReadTraceBudget = 90;
-    //Fluid-33: NO restoreStockValuesForHUD here. Getter hooks now return CACHED
-    //stock values during sensitive windows - SpringBoard reads stock without object
-    //writes. Eliminates the Fluid-17..Fluid-32 flash root cause: synchronous mass
-    //object rewriting colliding with in-flight island pill animations.
+    diagLog(@"deviceLocked %d -> %d (%s)", old, locked, source);
 }
 
 static void lockCompleteDarwinCallback(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo){
@@ -534,33 +134,31 @@ static void startLockPolling(void){
     dispatch_source_set_timer(lockPollTimer,
                               dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
                               (int64_t)(0.5 * NSEC_PER_SEC), 0);
-    __block NSInteger heartbeatTicks = 0;
     dispatch_source_set_event_handler(lockPollTimer, ^{
         setDeviceLocked(queryUILocked(), "poll");
-        //Fluid-8: positive-evidence heartbeat. If the flash loop keeps running while this
-        //reports budget left, the loop provably makes NO hooked setter calls at all ->
-        //frozen-copy/controller-cache disease, not a settings-object disease.
-        if (deviceLocked && (++heartbeatTicks % 20) == 0) {
-            diagLog(@"heartbeat: locked, diagBudget left=%ld", (long)diagBudget);
-        }
     });
     dispatch_resume(lockPollTimer);
 }
 
-//Folder dock spring acceleration (Fluid-22) - write at animation start.
-//Fluid-21 field logs disproved the four read-site fingerprints (0x77d970 ...):
-//those sites read 0.19-response helper objects, NOT the zoom spring, and the
-//async writes there compounded 0.19 -> 0.00019 (runaway re-identification).
+//Folder dock spring acceleration (Fluid-22, field-verified) --------------------
 //The real zoom spring object is [SBFolderIconZoomAnimator dockAnimationSettings]
-//(SBFFluidBehaviorSettings response 0.531 / dampingRatio 0.845 in the field
-//logs) and it is created FRESH for every open/close and discarded afterwards
-//(pointers never repeat). So: scale it synchronously inside the
-//_performAnimationToFraction hook, BEFORE %orig builds the spring from it -
-//the same direct setResponse:/setDampingRatio: write pattern used everywhere
-//else (getter multiplication stays BANNED, Fluid-18). No restore needed: the
-//object dies with the animation. The weak stock maps keep the original
-//baseline so repeated calls on the same object (interruption re-entry) scale
-//from stock and converge instead of compounding.
+//(SBFFluidBehaviorSettings response 0.531 / dampingRatio 0.845) and it is created
+//FRESH for every open/close and discarded afterwards (pointers never repeat).
+//We scale it synchronously inside the _performAnimationToFraction hook, BEFORE
+//%orig builds the spring from it. No restore needed: the object dies with the
+//animation. The weak stock maps keep the original baseline so repeated calls on
+//the same object (interruption re-entry) scale from stock and converge instead
+//of compounding. Getter multiplication stays BANNED (Fluid-18 freeze disaster).
+static NSMapTable *folderDockStockResponse;   //weak key -> NSNumber stock response
+static NSMapTable *folderDockStockDamping;    //weak key -> NSNumber stock dampingRatio
+
+static void initFolderDockMaps(void){
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        folderDockStockResponse = [NSMapTable mapTableWithKeyOptions:NSMapTableWeakMemory | NSMapTableObjectPointerPersonality valueOptions:NSMapTableStrongMemory];
+        folderDockStockDamping = [NSMapTable mapTableWithKeyOptions:NSMapTableWeakMemory | NSMapTableObjectPointerPersonality valueOptions:NSMapTableStrongMemory];
+    });
+}
 
 static void folderScaleDockValue(id obj, BOOL isResponse, double mult){
     if (!obj || mult == 1.0 || mult <= 0) return;
@@ -577,340 +175,33 @@ static void folderScaleDockValue(id obj, BOOL isResponse, double mult){
     }
     double target = stock * mult;
     if (fabs(cur - target) <= 0.0001) return; //already in place
-    restoringForHUD = YES;   //our own writes pass straight through the scaling hooks
-    speedsterInternalProbe = YES;
     if (isResponse) [(id)obj setResponse:target];
     else [(id)obj setDampingRatio:target];
-    speedsterInternalProbe = NO;
-    restoringForHUD = NO;
     diagLogB(@"[folder-fluid] dock %s %g->%g (x%.3f)", isResponse ? "response" : "dampingRatio", cur, target, mult);
 }
 
-//App Open animation and bouncing
-%hook SBFFluidBehaviorSettings
-    //Fluid-15 read-side instrumentation: while locked every WRITE is stock, so if the
-    //pill still flashes the poison was READ (and privately frozen) while unlocked.
-    //Sample the first unlocked reads of each value: the [unlock-read] backtraces show
-    //exactly which controller touches a (possibly tweaked) value right before freezing
-    //it. Selectors verified present in the iOS 17 SymMap dump. Perf: class-once logging
-    //and an 8/session trace budget keep the hot getter path cheap.
-    //Fluid-33: stock-on-read pattern. Sensitive windows (lock/HUD/unlock-grace)
-    //return CACHED stock values from setter-populated maps - no object writes =
-    //no conflict with in-flight island pill animations. SAFETY (Fluid-18 lesson):
-    //returns CONSTANT cache values, never multiplies - per-frame reads are stable.
-    -(double)response{
-        double v = %orig;
-        if(isOnSpringBoard){
-            if(deviceLocked || volumeHUDActive || unlockGraceActive()){
-                initStockMaps(); [stockValuesLock lock];
-                NSNumber *stock = [stockResponseValues objectForKey:self];
-                [stockValuesLock unlock];
-                if(stock) return [stock doubleValue];
-            }
-            if(!deviceLocked){ diagLogClassOnce(@"get-response", self, v); unlockSampleTrace(@"get-response", self, v); folderSampleTrace(@"get-response", self, v); }
-        }
-        return v;
-    }
-    -(double)dampingRatio{
-        double v = %orig;
-        if(isOnSpringBoard){
-            if(deviceLocked || volumeHUDActive || unlockGraceActive()){
-                initStockMaps(); [stockValuesLock lock];
-                NSNumber *stock = [stockDampingRatioValues objectForKey:self];
-                [stockValuesLock unlock];
-                if(stock) return [stock doubleValue];
-            }
-            if(!deviceLocked){ diagLogClassOnce(@"get-dampingRatio", self, v); unlockSampleTrace(@"get-dampingRatio", self, v); folderSampleTrace(@"get-dampingRatio", self, v); }
-        }
-        return v;
-    }
-    -(double)settlingDuration{
-        double v = %orig;
-        if(isOnSpringBoard && !deviceLocked){ diagLogClassOnce(@"get-settlingDuration", self, v); unlockSampleTrace(@"get-settlingDuration", self, v); folderSampleTrace(@"get-settlingDuration", self, v); }
-        return v;
-    }
+//Folder BSAnimationSettings time dilation (Fluid-25/26/27, field-verified) -----
+//SBReversibleLayerPropertyAnimator.animateWithSettings: family carries BaseBoard
+//BSAnimationSettings (duration / mass / stiffness / damping / speed); the folder
+//zoom spring is one of them. Acceleration = uniform time dilation: duration*mult,
+//stiffness/(mult^2), damping*zeta/mult - omega scales by 1/mult (zeta slider
+//independent, c*zeta/mult so each knob works alone or together).
+//In-place capture/scale/restore (Fluid-25/26 hard lessons):
+//  - NEVER pass a different object identity into the animation system
+//  - ALWAYS restore stock values right after %orig
+//  - mark in-flight objects (associated object) so nested calls cannot
+//    double-scale (snowball k 341.51 -> 3.4e-6 => SIGABRT safe mode)
+//The reversal path (_reverseWithSettings:) is not hooked - it stays stock.
+static CFAbsoluteTime folderReadWindowUntil = 0; //opens when the folder zoom hook fires
 
-    -(void)setResponse:(double)arg1{ //App open and close speed
-        if(restoringForHUD){ %orig; return; }
-        if(isOnSpringBoard){
-            recordStockValue(stockResponseValues, self, arg1);
-            diagLogClassOnce(@"setResponse", self, arg1);
-            if(bootGraceActive()){
-                %orig;
-                return;
-            }
-            if(unlockGraceActive()){ //Fluid-14: just-unlocked boundary stays stock
-                %orig;
-                return;
-            }
-        }
-        if(volumeHUDActive){ //stock volume HUD: keep untouched, don't disturb switcher state
-            %orig;
-            return;
-        }
-        if(deviceLocked){ //lock-screen island/UI (e.g. lock pill) animations run stock
-            diagLogB(@"setResponse %g while locked (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self);
-            %orig;
-            return;
-        }
-        if(isSpeedEnable){
-            if(!isFineTuneSpeedEnable){
-                //Fluid-32: mark for touched-only restore (slider default case never scales;
-                //a stray no-op restore write for it is harmless)
-                markTouched(touchedFluidResponse, self);
-                //Change speed value base on selector pos
-                switch (Speedvalue){
-                case 1:
-                    %orig(0.37);
-                    SwitcherDismiss = 0.2;
-                    break;
-                case 2: 
-                    %orig(0.25);
-                    SwitcherDismiss = 0.17;
-                    break;
-                case 3:
-                    %orig(0.19);
-                    SwitcherDismiss = 0.15;
-                    break;
-                case 4:
-                    %orig(0.1);
-                    SwitcherDismiss = 0.12;
-                    break;
-                case 5:   
-                    %orig(0.07);
-                    SwitcherDismiss = 0.1;
-                    break;   
-                default:
-                    %orig;
-                    SwitcherDismiss = -1;    
-                    break;
-                }
-            }else{
-                //Fine Tune Mode
-                if(FineTuneSpeedValue <= 0.0005){ //Fluid-14: 0% = never touch the object (true stock kill switch)
-                    %orig;
-                    SwitcherDismiss = -1;
-                    return;
-                }
-                markTouched(touchedFluidResponse, self); //Fluid-32: touched-only restore
-                %orig(reverseSpeedSliderValue(FineTuneSpeedValue));
-                //Check Speed Value and change SpringBoard and Switcher Dismiss speed accordingly
-                if (reverseSpeedSliderValue(FineTuneSpeedValue) < 0.4 && reverseSpeedSliderValue(FineTuneSpeedValue) >= 0.37){
-                    SwitcherDismiss = 0.2;
-                    //SpringboardSpeed = 1.1;
-                }else if(reverseSpeedSliderValue(FineTuneSpeedValue) < 0.37 && reverseSpeedSliderValue(FineTuneSpeedValue) >= 0.25){
-                    SwitcherDismiss = 0.17;
-                    //SpringboardSpeed = 1.3;
-                }else if(reverseSpeedSliderValue(FineTuneSpeedValue) < 0.25 && reverseSpeedSliderValue(FineTuneSpeedValue) >= 0.19){
-                    SwitcherDismiss = 0.15;
-                    //SpringboardSpeed = 1.5;
-                }else if(reverseSpeedSliderValue(FineTuneSpeedValue) < 0.19 && reverseSpeedSliderValue(FineTuneSpeedValue) >= 0.1){
-                    SwitcherDismiss = 0.12;
-                    //SpringboardSpeed = 1.75;
-                }else if(reverseSpeedSliderValue(FineTuneSpeedValue) < 0.1){
-                    SwitcherDismiss = 0.1;
-                    //SpringboardSpeed = 2;                    
-                }else{
-                    //Slider at or below its minimum: keep the system default
-                    SwitcherDismiss = -1;
-                }
-            }            
-        }else{
-            %orig;
-            SwitcherDismiss = -1;
-            //SpringboardSpeed = -1;
-        }
-    }
-    -(void)setDampingRatio:(double)arg1{ //App open and close bouncing (volume HUD is exempted, see note above)
-        if(restoringForHUD){ %orig; return; }
-        if(isOnSpringBoard){
-            recordStockValue(stockDampingRatioValues, self, arg1);
-            diagLogClassOnce(@"setDampingRatio", self, arg1);
-            if(bootGraceActive()){
-                %orig;
-                return;
-            }
-            if(unlockGraceActive()){ //Fluid-14: just-unlocked boundary stays stock
-                %orig;
-                return;
-            }
-        }
-        if(volumeHUDActive){ //stock volume HUD: keep untouched
-            %orig;
-            return;
-        }
-        if(deviceLocked){ //lock-screen island/UI (e.g. lock pill) animations run stock
-            diagLogB(@"setDampingRatio %g while locked (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self);
-            %orig;
-            return;
-        }
-        if(isBounceEnable){
-            if(!isFineTuneBounceEnable){
-                markTouched(touchedFluidDampingRatio, self); //Fluid-32: touched-only restore
-                switch (Bouncevalue){
-                    case 1:
-                        %orig(0.9);
-                        break;
-                    case 2:
-                        %orig(0.8);
-                        break;
-                    case 3:
-                        %orig(0.6);
-                        break;
-                    case 4:
-                        %orig(0.4);
-                        break;
-                    case 5:
-                        %orig(0.2);
-                        break;
-                    default:
-                        %orig;
-                        break;    
-                }
-            }else{
-                if(FineTuneBounceValue <= 0.0005){ //Fluid-14: 0% = never touch the object (true stock kill switch)
-                    %orig;
-                    return;
-                }
-                markTouched(touchedFluidDampingRatio, self); //Fluid-32: touched-only restore
-                %orig(reverseBounceSliderValue(FineTuneBounceValue));
-            }
-        }else{
-            %orig;
-        }
-    }
-
-%end
-
-//Springboard speed (mostly for folder but might affect something else on springboard too)
-%hook SBFAnimationSettings
-
-    //Fluid-33: stock-on-read for legacy folder path.
-    -(double)mass{
-        double v = %orig;
-        if(isOnSpringBoard && (deviceLocked || volumeHUDActive || unlockGraceActive())){
-            initStockMaps(); [stockValuesLock lock];
-            NSNumber *stock = [stockMassValues objectForKey:self];
-            [stockValuesLock unlock];
-            if(stock) return [stock doubleValue];
-        }
-        return v;
-    }
-    -(double)damping{
-        double v = %orig;
-        if(isOnSpringBoard && (deviceLocked || volumeHUDActive || unlockGraceActive())){
-            initStockMaps(); [stockValuesLock lock];
-            NSNumber *stock = [stockDampingValues objectForKey:self];
-            [stockValuesLock unlock];
-            if(stock) return [stock doubleValue];
-        }
-        return v;
-    }
-
-    -(void)setDamping:(double)arg1{
-        if(restoringForHUD){ %orig; return; }
-        if(isOnSpringBoard){
-            recordStockValue(stockDampingValues, self, arg1);
-            diagLogClassOnce(@"setDamping", self, arg1);
-            if(bootGraceActive()){
-                %orig;
-                return;
-            }
-            if(unlockGraceActive()){ //Fluid-14: just-unlocked boundary stays stock
-                %orig;
-                return;
-            }
-        }
-        if(volumeHUDActive){ //stock volume HUD: keep untouched
-            %orig;
-            return;
-        }
-        if(deviceLocked){ //lock-screen animations run stock
-            diagLogB(@"SBFAnimationSettings setDamping %g while locked (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self);
-            %orig;
-            return;
-        }
-        if(isInstantFolder){
-            %orig;
-        }else{
-            if(isFolderAnimationEnabled && isFolderAnimationBounceEnabled){
-                markTouched(touchedAnimDamping, self); //Fluid-32: touched-only restore
-                %orig(arg1*reverseFolderSliderValue(FolderDampingValue));
-            }else{
-                %orig;
-            }
-        }
-    }
-
-    //folder mass
-    -(void)setMass:(double)arg1{
-        if(restoringForHUD){ %orig; return; }
-        if(isOnSpringBoard){
-            recordStockValue(stockMassValues, self, arg1);
-            diagLogClassOnce(@"setMass", self, arg1);
-            if(bootGraceActive()){
-                %orig;
-                return;
-            }
-            if(unlockGraceActive()){ //Fluid-14: just-unlocked boundary stays stock
-                %orig;
-                return;
-            }
-        }
-        if(volumeHUDActive){ //stock volume HUD: keep untouched
-            %orig;
-            return;
-        }
-        if(deviceLocked){ //lock-screen animations run stock
-            diagLogB(@"SBFAnimationSettings setMass %g while locked (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self);
-            %orig;
-            return;
-        }
-        if(isInstantFolder){
-            markTouched(touchedAnimMass, self); //Fluid-32: touched-only restore
-            %orig(arg1*0.0001);
-        }else{
-            if(isFolderAnimationEnabled){
-                markTouched(touchedAnimMass, self); //Fluid-32: touched-only restore
-                %orig(arg1*reverseFolderSliderValue(FolderMassValue));
-            }else{
-                %orig;
-            }
-        }
-    }
-
-%end
-
-//Fluid-24/26: the REAL folder zoom timing knob. Field logs (Fluid-23) prove the zoom
-//never consumes SBFFluidBehaviorSettings response/dampingRatio (rewriting them -
-//even through the global setResponse: slider hook - has zero visual effect) and
-//the SBH*Settings chain carries no duration members. The zoom is driven by
-//SBReversibleLayerPropertyAnimator (homeScreenScaleAnimator + targetIconScaleX/Y
-//Animators on SBScaleIconZoomAnimator) whose animateWithSettings: family takes a
-//BaseBoard BSAnimationSettings (duration / mass / stiffness / damping / speed).
-//Acceleration = uniform time dilation: duration*mult, stiffness/(mult^2),
-//damping/mult, mass untouched - omega scales by 1/mult and zeta stays invariant,
-//so the motion curve is identical, just mult times faster. Window-gated to the
-//folder zoom (folderReadWindowUntil) so nothing else is hit.
-//Fluid-26: in-place capture/scale/restore. Fluid-25 taught two hard lessons:
-//(1) the spring time-dilation math was INVERTED - k*mult^2 actually SLOWS the
-//spring (correct acceleration is stiffness/(mult^2), damping/mult, so omega
-//scales by 1/mult); (2) handing %orig a mutableCopy broke _reverseWithSettings:'s
-//object-identity validation AND nested hook calls re-scaled the same values
-//(snowball k 341.51 -> 3.4e-6) => uncaught exception => SIGABRT safe mode.
-//Rules going forward: NEVER pass a different object identity into the animation
-//system, ALWAYS restore stock values right after %orig, and mark in-flight
-//objects (associated object) so nested calls cannot double-scale. The reversal
-//path (_reverseWithSettings:) is no longer hooked at all - it stays stock.
 static void *folderBSScaleSavedKey = &folderBSScaleSavedKey;
 static void folderScaleBSAnimSettingsInPlace(id settings, const char *via){
     if (!settings) return;
     if (!isOnSpringBoard || deviceLocked) return;
     if (CFAbsoluteTimeGetCurrent() > folderReadWindowUntil) return;
     if (objc_getAssociatedObject(settings, folderBSScaleSavedKey)) return; //re-entrant: outer call already scaled this object
-    //Fluid-27: speed and bounce are independent knobs. mult dilates time (smaller =
-    //faster); zeta scales the damping ratio (smaller = more visible bounce). The
-    //spring branch applies c*zeta/mult so each slider works alone or together.
+    //speed and bounce are independent knobs. mult dilates time (smaller = faster);
+    //zeta scales the damping ratio (smaller = more visible bounce).
     double mult = 1.0;
     if (isFolderAnimationEnabled && FolderMassValue > 0.0005) mult = reverseFolderSliderValue(FolderMassValue);
     double zeta = 1.0;
@@ -955,6 +246,78 @@ static void folderRestoreBSAnimSettings(id settings){
     }
 }
 
+//Folder open/close zoom, iOS 17 write-side mechanism (Fluid-20..27) ------------
+//Architecture (verified against iOS 17 runtime headers): SBFolderController
+//_newAnimatorForZoomUp: creates an SBFolderIconZoomAnimator per open/close; the
+//zoom spring is built inside _performAnimationToFraction:withCentralAnimationSettings:
+//from the passed SBFAnimationSettings (SBHFolderZoomSettings.centralAnimationSettings)
+//and from dockAnimationSettings. On iOS 17 the legacy setMass:/setDamping: hooks
+//are dead code for folders (those setters fire once at boot only), so we scale the
+//passed objects directly here: write scaled values BEFORE %orig (the animation
+//snapshots its parameters there) and restore the stock values right after.
+%group FolderZoom
+
+//Diagnostics: identifies which animator class actually runs. If the speed slider
+//ever fails to take effect, these lines say whether the hook fired at all.
+%hook SBFolderController
+    - (id)_newAnimatorForZoomUp:(bool)arg1 {
+        id animator = %orig;
+        if (isOnSpringBoard && animator && !deviceLocked) {
+            diagLogB(@"[folder-animator] zoomUp=%d class=%@", arg1, NSStringFromClass([animator class]));
+        }
+        return animator;
+    }
+%end
+
+%hook SBFolderIconZoomAnimator
+    - (void)_performAnimationToFraction:(double)arg1 withCentralAnimationSettings:(id)arg2 delay:(double)arg3 alreadyAnimating:(bool)arg4 sharedCompletion:(id)arg5 {
+        //open the BSAnimationSettings scale window for the animation's lifetime
+        //(the real spring may read per-frame via the reversible animators)
+        if (isOnSpringBoard && !deviceLocked) {
+            folderReadWindowUntil = CFAbsoluteTimeGetCurrent() + 2.5;
+        }
+        BOOL applied = NO;
+        double savedMass = 0, savedDamping = 0;
+        if (isOnSpringBoard && !deviceLocked && arg2
+            && [arg2 respondsToSelector:@selector(mass)] && [arg2 respondsToSelector:@selector(damping)]) {
+            double stockMass = [(id)arg2 mass];
+            double stockDamping = [(id)arg2 damping];
+            double massMult = 1.0, dampingMult = 1.0;
+            if (isFolderAnimationEnabled && FolderMassValue > 0.0005) {
+                massMult = reverseFolderSliderValue(FolderMassValue);
+            }
+            if (isFolderAnimationEnabled && isFolderAnimationBounceEnabled && FolderDampingValue > 0.0005) {
+                dampingMult = reverseFolderSliderValue(FolderDampingValue);
+            }
+            if (massMult != 1.0 || dampingMult != 1.0) {
+                savedMass = stockMass;
+                savedDamping = stockDamping;
+                if (massMult != 1.0) [(id)arg2 setMass:stockMass * massMult];
+                if (dampingMult != 1.0) [(id)arg2 setDamping:stockDamping * dampingMult];
+                applied = YES;
+                diagLogB(@"[folder-zoom] frac=%g already=%d mass %g x%.3f damping %g x%.3f obj=%p %@",
+                         arg1, arg4, stockMass, massMult, stockDamping, dampingMult, arg2, NSStringFromClass([arg2 class]));
+                //scale the REAL zoom spring object (fresh per open/close, dies after)
+                if ([self respondsToSelector:@selector(dockAnimationSettings)]) {
+                    id dock = [self performSelector:@selector(dockAnimationSettings)];
+                    if (dock && [dock respondsToSelector:@selector(response)]
+                            && [dock respondsToSelector:@selector(setResponse:)]) {
+                        folderScaleDockValue(dock, YES, massMult);
+                        folderScaleDockValue(dock, NO, dampingMult);
+                    }
+                }
+            }
+        }
+        %orig;
+        if (applied) { //the animation snapshotted its parameters inside %orig; restore stock
+            [(id)arg2 setMass:savedMass];
+            [(id)arg2 setDamping:savedDamping];
+        }
+    }
+%end
+%end
+
+//Reversible layer animators carry the REAL zoom timing (BSAnimationSettings) ---
 %group ReversibleAnim
 %hook SBReversibleLayerPropertyAnimator
     - (void)animateWithSettings:(id)arg1 completion:(id)arg2 {
@@ -981,352 +344,6 @@ static void folderRestoreBSAnimSettings(id settings){
 %end
 %end
 
-//Folder open/close zoom, iOS 17 write-side mechanism (Fluid-20)
-//Architecture (verified against iOS 17 runtime headers): SBFolderController
-//_newAnimatorForZoomUp: creates an SBFolderIconZoomAnimator per open/close; the
-//zoom spring is built inside _performAnimationToFraction:withCentralAnimationSettings:
-//from the passed SBFAnimationSettings (SBHFolderZoomSettings.centralAnimationSettings).
-//On iOS 17 those setters only fire ONCE at boot, so the legacy setMass:/setDamping:
-//multiplication hooks above are dead code for folders. NEVER multiply the
-//SBFFluidBehaviorSettings getters (Fluid-18 freeze disaster: read-side scaling
-//watchdog-kills SpringBoard). Instead: write scaled mass/damping into the passed
-//settings object BEFORE %orig (the animation snapshots its parameters there) and
-//restore the stock values right after - the same scoped write/restore pattern the
-//volume HUD and lock pill fixes use. Our own writes pass through the SBFAnimation-
-//Settings hooks via restoringForHUD so nothing gets double-scaled.
-%group FolderZoom
-
-//Diagnostics: identifies which animator class actually runs and what the settings
-//chain holds. If the speed slider ever fails to take effect, these lines say
-//whether the hooks fired and which object the spring really comes from.
-%hook SBFolderController
-    - (id)_newAnimatorForZoomUp:(bool)arg1 {
-        id animator = %orig;
-        if (isOnSpringBoard && animator && !deviceLocked) {
-            diagLogB(@"[folder-animator] zoomUp=%d class=%@", arg1, NSStringFromClass([animator class]));
-            id settings = [animator respondsToSelector:@selector(settings)] ? [animator performSelector:@selector(settings)] : nil;
-            if (settings) {
-                id central = [settings respondsToSelector:@selector(centralAnimationSettings)] ? [settings performSelector:@selector(centralAnimationSettings)] : nil;
-                if (central && [central respondsToSelector:@selector(mass)] && [central respondsToSelector:@selector(damping)]) {
-                    speedsterInternalProbe = YES;
-                    diagLogB(@"[folder-animator] central=%p %@ mass=%g damping=%g",
-                             central, NSStringFromClass([central class]), [(id)central mass], [(id)central damping]);
-                    if ([animator respondsToSelector:@selector(dockAnimationSettings)]) {
-                        id dock = [animator performSelector:@selector(dockAnimationSettings)];
-                        if (dock && [dock respondsToSelector:@selector(response)]) {
-                            //direct msgSend: UIKit declares a differently-typed -response somewhere,
-                            //so the bracket syntax fails the ambiguity check
-                            double resp = ((double(*)(id, SEL))objc_msgSend)(dock, @selector(response));
-                            double damp = ((double(*)(id, SEL))objc_msgSend)(dock, @selector(dampingRatio));
-                            diagLogB(@"[folder-animator] dock=%p %@ response=%g dampingRatio=%g",
-                                     dock, NSStringFromClass([dock class]), resp, damp);
-                        }
-                    }
-                    speedsterInternalProbe = NO;
-                }
-            }
-        }
-        return animator;
-    }
-%end
-
-%hook SBFolderIconZoomAnimator
-    - (void)_performAnimationToFraction:(double)arg1 withCentralAnimationSettings:(id)arg2 delay:(double)arg3 alreadyAnimating:(bool)arg4 sharedCompletion:(id)arg5 {
-        //Fluid-23: open the read-trace window for the animation's lifetime (the real
-        //spring may read per-frame), and once per session dump the animator's whole
-        //settings chain so the log names every container it carries.
-        static BOOL folderDumped = NO;
-        if (isOnSpringBoard && !deviceLocked) {
-            folderReadWindowUntil = CFAbsoluteTimeGetCurrent() + 2.5;
-            if (!folderDumped && folderReadTraceBudget > 0) {
-                folderDumped = YES;
-                diagLogB(@"[folder-dump] animator=%p %@", self, NSStringFromClass([self class]));
-                folderDumpSettingsChain(self, "animator");
-                id zsettings = [self respondsToSelector:@selector(settings)]
-                    ? ((id(*)(id, SEL))objc_msgSend)(self, @selector(settings)) : nil;
-                if (zsettings) folderDumpSettingsChain(zsettings, "zoomSettings");
-            }
-        }
-        BOOL applied = NO;
-        double savedMass = 0, savedDamping = 0;
-        if (isOnSpringBoard && !deviceLocked && !bootGraceActive() && !volumeHUDActive && arg2
-            && [arg2 respondsToSelector:@selector(mass)] && [arg2 respondsToSelector:@selector(damping)]) {
-            double stockMass = [(id)arg2 mass];
-            double stockDamping = [(id)arg2 damping];
-            double massMult = 1.0, dampingMult = 1.0;
-            if (isFolderAnimationEnabled && FolderMassValue > 0.0005) {
-                massMult = reverseFolderSliderValue(FolderMassValue);
-            }
-            if (isFolderAnimationEnabled && isFolderAnimationBounceEnabled && FolderDampingValue > 0.0005) {
-                dampingMult = reverseFolderSliderValue(FolderDampingValue);
-            }
-            if (massMult != 1.0 || dampingMult != 1.0) {
-                savedMass = stockMass;
-                savedDamping = stockDamping;
-                restoringForHUD = YES; //our writes must bypass the SBFAnimationSettings scaling hooks
-                if (massMult != 1.0) [(id)arg2 setMass:stockMass * massMult];
-                if (dampingMult != 1.0) [(id)arg2 setDamping:stockDamping * dampingMult];
-                applied = YES;
-                diagLogB(@"[folder-zoom] frac=%g already=%d mass %g x%.3f damping %g x%.3f obj=%p %@",
-                         arg1, arg4, stockMass, massMult, stockDamping, dampingMult, arg2, NSStringFromClass([arg2 class]));
-                //Fluid-22: scale the REAL zoom spring object. It is created fresh
-                //for every open/close and consumed inside %orig, so scaling it
-                //here - before %orig - is what actually changes the speed.
-                if ([self respondsToSelector:@selector(dockAnimationSettings)]) {
-                    id dock = [self performSelector:@selector(dockAnimationSettings)];
-                    if (dock && [dock respondsToSelector:@selector(response)]
-                            && [dock respondsToSelector:@selector(setResponse:)]) {
-                        folderScaleDockValue(dock, YES, massMult);
-                        folderScaleDockValue(dock, NO, dampingMult);
-                    }
-                }
-            }
-        }
-        %orig;
-        if (applied) { //the animation snapshotted its parameters inside %orig; restore stock
-            restoringForHUD = YES;
-            [(id)arg2 setMass:savedMass];
-            [(id)arg2 setDamping:savedDamping];
-            restoringForHUD = NO;
-        }
-    }
-%end
-%end
-
-//In-App animation
-//Fluid-31: re-entrancy depth for the in-app section. The field log showed double
-//scaling (UIView.animate 0.7->0.07 then the inner CAAnimation 0.07->0.007 = x100
-//instead of x10, felt "too fast"). While inside a hooked UIView animation entry's
-//%orig, the inner object-level hooks (CAAnimation/CASpringAnimation/
-//UISpringTimingParameters) skip re-scaling - the outer call already scaled.
-static NSInteger inAppUIKitDepth = 0;
-static BOOL inAppScalingSuppressed(void){ return inAppUIKitDepth > 0; }
-%hook CASpringAnimation
-
-    //mass
-    -(void)setMass:(double)arg1{ //in app speed
-        if(inAppAnimationEnabled && !isOnSpringBoard && !inAppScalingSuppressed()){
-            double out = arg1 * reverseAppSpeedSliderValue(MassValue);
-            diagLogB(@"[app-ca] mass %g->%g", arg1, out);
-            %orig(out);
-        }else{
-            %orig(arg1);
-        }
-    }
-
-    -(void)setDamping:(double)arg1{
-        if((inAppAnimationEnabled && inAppAnimationBounceEnabled) && !isOnSpringBoard && DampingValue > 0.0005 && !inAppScalingSuppressed()){
-            double out = arg1 * reverseAppSpeedSliderValue(DampingValue);
-            diagLogB(@"[app-ca] damping %g->%g", arg1, out);
-            %orig(out);
-        }else{
-            %orig(arg1);
-        }
-    }
-
-%end
-
-//Fluid-28: modern in-app springs. iOS 17 UIKit springs are built through
-//UISpringTimingParameters initializers (the UIViewPropertyAnimator path); the
-//legacy CASpringAnimation setters above are almost never called anymore, which
-//is why in-app speed never took effect. Initializer hooks scale plain value
-//arguments before forwarding - no object identity changes, no KVC, no getter
-//exceptions, so the Fluid-25 failure class is impossible by construction.
-//Uniform time dilation (mult<1 = faster): stiffness/(mult^2), damping/(mult)
-//[x zeta for bounce]; mass and dampingRatio are shape/units knobs and stay put.
-%hook UISpringTimingParameters
-
-    - (instancetype)initWithMass:(CGFloat)mass stiffness:(CGFloat)stiffness dampingRatio:(CGFloat)dampingRatio initialVelocity:(CGVector)velocity {
-        double mult = 1.0, zeta = 1.0;
-        if (inAppAnimationEnabled && !isOnSpringBoard && MassValue > 0.0005 && !inAppScalingSuppressed()) mult = reverseAppSpeedSliderValue(MassValue);
-        if (inAppAnimationEnabled && inAppAnimationBounceEnabled && !isOnSpringBoard && DampingValue > 0.0005 && !inAppScalingSuppressed()) zeta = reverseAppSpeedSliderValue(DampingValue);
-        if (mult >= 1.0 && zeta >= 1.0) return %orig;
-        double k = stiffness / (mult * mult);
-        double zr = dampingRatio * zeta;
-        diagLogB(@"[app-spring] mass %g k %g->%g zeta %g->%g", mass, stiffness, k, dampingRatio, zr);
-        return %orig(mass, k, zr, velocity);
-    }
-
-    - (instancetype)initWithDampingRatio:(CGFloat)dampingRatio frequencyResponse:(CGFloat)frequencyResponse initialVelocity:(CGVector)velocity {
-        double mult = 1.0, zeta = 1.0;
-        if (inAppAnimationEnabled && !isOnSpringBoard && MassValue > 0.0005 && !inAppScalingSuppressed()) mult = reverseAppSpeedSliderValue(MassValue);
-        if (inAppAnimationEnabled && inAppAnimationBounceEnabled && !isOnSpringBoard && DampingValue > 0.0005 && !inAppScalingSuppressed()) zeta = reverseAppSpeedSliderValue(DampingValue);
-        if (mult >= 1.0 && zeta >= 1.0) return %orig;
-        double f = frequencyResponse / mult;
-        double zr = dampingRatio * zeta;
-        diagLogB(@"[app-spring] freq %g->%g zeta %g->%g", frequencyResponse, f, dampingRatio, zr);
-        return %orig(zr, f, velocity);
-    }
-
-    - (instancetype)initWithDampingCoefficient:(CGFloat)dampingCoefficient mass:(CGFloat)mass stiffness:(CGFloat)stiffness initialVelocity:(CGVector)velocity {
-        double mult = 1.0, zeta = 1.0;
-        if (inAppAnimationEnabled && !isOnSpringBoard && MassValue > 0.0005 && !inAppScalingSuppressed()) mult = reverseAppSpeedSliderValue(MassValue);
-        if (inAppAnimationEnabled && inAppAnimationBounceEnabled && !isOnSpringBoard && DampingValue > 0.0005 && !inAppScalingSuppressed()) zeta = reverseAppSpeedSliderValue(DampingValue);
-        if (mult >= 1.0 && zeta >= 1.0) return %orig;
-        double k = stiffness / (mult * mult);
-        double c = dampingCoefficient * zeta / mult;
-        diagLogB(@"[app-spring] mass %g k %g->%g c %g->%g", mass, stiffness, k, dampingCoefficient, c);
-        return %orig(c, mass, k, velocity);
-    }
-
-%end
-
-//Fluid-30: the VISIBLE app transitions (navigation push/pop, modals, crossfades,
-//keyboards) are TIMED animations, not springs - that is why scaling spring mass
-//(Fluid-28, confirmed firing 224x in the field log) was imperceptible. Hook the
-//UIKit animation entry points plus CAAnimation's duration setter. All hooks scale
-//plain value arguments before forwarding (no object identity changes, no KVC, no
-//getter exceptions - the Fluid-25 failure class stays impossible by construction).
-//The same DurationMassValue slider drives springs and timed animations; mult<1 =
-//faster. In-app bounce slider scales the spring-variant's damping ratio only.
-//Fluid-31: the field log showed double-scaling (UIView.animate 0.7->0.07 then the
-//inner CAAnimation 0.07->0.007 = x100 instead of x10, "too fast"). The depth
-//counter (declared above the in-app section) marks the UIKit entry's %orig so
-//CA-level hooks skip re-scaling while inside.
-%hook UIView
-
-    + (void)animateWithDuration:(double)arg1 animations:(id)arg2 {
-        double out = arg1;
-        if (inAppAnimationEnabled && !isOnSpringBoard && MassValue > 0.0005) {
-            out = arg1 * reverseAppSpeedSliderValue(MassValue);
-            diagLogB(@"[app-timed] UIView.animate %g->%g", arg1, out);
-        }
-        inAppUIKitDepth++;
-        %orig(out, arg2);
-        inAppUIKitDepth--;
-    }
-
-    + (void)animateWithDuration:(double)arg1 animations:(id)arg2 completion:(id)arg3 {
-        double out = arg1;
-        if (inAppAnimationEnabled && !isOnSpringBoard && MassValue > 0.0005) {
-            out = arg1 * reverseAppSpeedSliderValue(MassValue);
-            diagLogB(@"[app-timed] UIView.animate %g->%g", arg1, out);
-        }
-        inAppUIKitDepth++;
-        %orig(out, arg2, arg3);
-        inAppUIKitDepth--;
-    }
-
-    + (void)animateWithDuration:(double)arg1 delay:(double)arg2 options:(unsigned long long)arg3 animations:(id)arg4 completion:(id)arg5 {
-        double out = arg1;
-        if (inAppAnimationEnabled && !isOnSpringBoard && MassValue > 0.0005) {
-            out = arg1 * reverseAppSpeedSliderValue(MassValue);
-            diagLogB(@"[app-timed] UIView.animate %g->%g", arg1, out);
-        }
-        inAppUIKitDepth++;
-        %orig(out, arg2, arg3, arg4, arg5);
-        inAppUIKitDepth--;
-    }
-
-    + (void)animateWithDuration:(double)arg1 delay:(double)arg2 usingSpringWithDamping:(double)arg3 initialSpringVelocity:(double)arg4 options:(unsigned long long)arg5 animations:(id)arg6 completion:(id)arg7 {
-        if (inAppAnimationEnabled && !isOnSpringBoard && MassValue > 0.0005) {
-            double mult = reverseAppSpeedSliderValue(MassValue);
-            double zeta = (inAppAnimationBounceEnabled && DampingValue > 0.0005) ? reverseAppSpeedSliderValue(DampingValue) : 1.0;
-            double out = arg1 * mult;
-            double damp = arg3 * zeta;
-            diagLogB(@"[app-timed] UIView.spring dur %g->%g damping %g->%g", arg1, out, arg3, damp);
-            inAppUIKitDepth++;
-            %orig(out, arg2, damp, arg4, arg5, arg6, arg7);
-            inAppUIKitDepth--;
-        } else {
-            %orig;
-        }
-    }
-
-    + (void)animateKeyframesWithDuration:(double)arg1 delay:(double)arg2 options:(unsigned long long)arg3 animations:(id)arg4 completion:(id)arg5 {
-        double out = arg1;
-        if (inAppAnimationEnabled && !isOnSpringBoard && MassValue > 0.0005) {
-            out = arg1 * reverseAppSpeedSliderValue(MassValue);
-            diagLogB(@"[app-timed] UIView.keyframes %g->%g", arg1, out);
-        }
-        inAppUIKitDepth++;
-        %orig(out, arg2, arg3, arg4, arg5);
-        inAppUIKitDepth--;
-    }
-
-    + (void)transitionWithView:(id)arg1 duration:(double)arg2 options:(unsigned long long)arg3 animations:(id)arg4 completion:(id)arg5 {
-        double out = arg2;
-        if (inAppAnimationEnabled && !isOnSpringBoard && MassValue > 0.0005) {
-            out = arg2 * reverseAppSpeedSliderValue(MassValue);
-            diagLogB(@"[app-timed] UIView.transition %g->%g", arg2, out);
-        }
-        inAppUIKitDepth++;
-        %orig(arg1, out, arg3, arg4, arg5);
-        inAppUIKitDepth--;
-    }
-
-%end
-
-%hook CAAnimation
-    - (void)setDuration:(double)arg1 {
-        if (inAppAnimationEnabled && !isOnSpringBoard && MassValue > 0.0005 && arg1 > 0.0001 && !inAppScalingSuppressed()) {
-            double out = arg1 * reverseAppSpeedSliderValue(MassValue);
-            diagLogB(@"[app-timed] CA duration %g->%g", arg1, out);
-            %orig(out);
-        } else {
-            %orig(arg1);
-        }
-    }
-%end
-
-//Screen Turn On and Off Speed
-//Fluid-13 FINAL root cause: while the device is locked, ANY non-stock wake animation
-//multiplier breaks the lock pill's presentation state machine - the pill's show/hide
-//animations complete faster than the island expects, so it re-presents endlessly
-//(100x = violent flip-flop, 3x = still flip-flops; Fluid-9's clamp wasn't enough).
-//Fluid-14 correction: the wake multiplier was NOT the root cause either. The Fluid-13
-//device log proved every hooked value path returns stock while locked AND the flash
-//loop makes zero hooked calls (heartbeat budget untouched) - the pill freezes tweaked
-//values captured at the lock transition, where %orig (the lock machinery that configures
-//the pill) ran BEFORE the stock restore. Fix = restore-before-%orig on lock + unlock
-//grace window + 0%-means-untouched kill switch. See SBLockScreenManager hooks below.
-//The settings-object "storm" in earlier logs is a red herring: it also fires during
-//the boot grace window when every hook is a pure pass-through. Meanwhile the wake
-//multiplier was the ONLY time-varying tweaked value left while locked, and it is
-//read exactly when the flash appears (screen wake on the lock screen).
-//Fluid-16: all three wake getters return the stock value in EVERY state - the Fluid-15
-//log proved the poison read happens ~1.3s BEFORE the lock flag flips (backlight-off
-//prep), so no state window is safe. The wake/sleep speed features are fully retired
-//(iOS 17 hard conflict with the lock pill); no hook anywhere writes these values.
-%hook SBFWakeAnimationSettings
-    //Fluid-16 FINAL: all three getters return stock ALWAYS. The Fluid-15 log caught the
-    //smoking gun: ~1.3s before EVERY lock (lock button -> backlight fade prep), while the
-    //lock flag still says "unlocked", the system reads backlightFadeDuration and got the
-    //tweaked+clamped 0.15 (stock 0.185) - a non-stock WAKE-FAMILY value inside the lock
-    //transition, the exact disease Fluid-13 proved fatal to the pill state machine (any
-    //multiplier != 1 in this family flip-flops the pill). Waking only ever happens from
-    //the locked/off state and sleeping only ever happens into it, so unlocked-phase
-    //reads of these getters are always transition-gap reads; the user-facing features
-    //were imperceptible anyway (clamped 0.15 vs 0.185 stock = 19% at the fastest slider).
-    -(double)backlightFadeDuration{ //Screen turn off speed
-        double stock = %orig;
-        if(deviceLocked || unlockGraceActive()){
-            diagLogB(@"backlightFadeDuration -> stock %g (%@)", stock, NSStringFromClass([(id)self class]));
-        }else{
-            diagLogClassOnce(@"backlightFadeDuration", self, stock);
-        }
-        return stock;
-    }
-    -(double)speedMultiplierForWake{ //Screen turn on speed (might be glitchy)
-        double stock = %orig;
-        if(deviceLocked || unlockGraceActive()){
-            diagLogB(@"speedMultiplierForWake -> stock %g (%@)", stock, NSStringFromClass([(id)self class]));
-        }else{
-            diagLogClassOnce(@"speedMultiplierForWake", self, stock);
-        }
-        return stock;
-    }
-    -(double)speedMultiplierForLiftToWake{ //Screen turn on speed but for lift to wake (again might be glitchy)
-        double stock = %orig;
-        if(deviceLocked || unlockGraceActive()){
-            diagLogB(@"speedMultiplierForLiftToWake -> stock %g (%@)", stock, NSStringFromClass([(id)self class]));
-        }else{
-            diagLogClassOnce(@"speedMultiplierForLiftToWake", self, stock);
-        }
-        return stock;
-    }
-%end
-
 //Extra extra
 %hook SBFluidSwitcherAnimationSettings
     -(void)setWallpaperScaleInSwitcher:(double)arg1{ //Switcher wallpaper zoom out
@@ -1335,7 +352,7 @@ static BOOL inAppScalingSuppressed(void){ return inAppUIKitDepth > 0; }
         }else{
             %orig;
         }
-    }    
+    }
 
     -(void)setHomeScreenScaleInSwitcher:(double)arg1{ //Switcher homescreen zoom out
         if(isNoiconZoominSwitcher){
@@ -1344,37 +361,35 @@ static BOOL inAppScalingSuppressed(void){ return inAppUIKitDepth > 0; }
             %orig;
         }
     }
+%end
 
-    -(double)emptySwitcherDismissDelay{ //Switcher fix when set speed too high
-        //Fluid-15 verdict: ZERO calls in an entire session (locked AND unlocked) - the
-        //getter is fully exonerated as the pill poison, so the switcher auto-dismiss
-        //timing feature returns (Fluid-14 behavior below).
-        if (isOnSpringBoard && (deviceLocked || unlockGraceActive())){
-            double stock = %orig;
-            diagLogB(@"dismissDelay while locked -> stock %g (SwitcherDismiss=%g, %@)", stock, SwitcherDismiss, NSStringFromClass([(id)self class]));
-            return stock;
+%hook CSCoverSheetTransitionSettings
+    -(BOOL)iconsFlyIn{ //fly in icon when unlock
+        if(isNoiconflyEnable){
+            return 0;
+        }else{
+            return %orig; //keep the system default (e.g. Respect Reduce Motion)
         }
-        //Volume HUD exemption: the HUD's auto-hide timing also flows through this
-        //fluid-framework delay, so while the HUD is active the stock delay must win
-        //or the HUD starts disappearing almost immediately (2.1.4-1 symptom: the
-        //hide ANIMATION was stock-speed after value restore, but it still began way early).
-        if (volumeHUDActive || SwitcherDismiss == -1){
-            return %orig;
-        }
-        return SwitcherDismiss;
     }
 %end
 
-//Authoritative lock-state transitions from the class that owns them (iOS 17 selectors
-//verified against the runtime dump; Logos silently skips wherever they don't exist).
-//The class is bound at %init time via objc_getClass, same pattern as VolumeControl.
+%hook SBIconView
+
+    -(void)setEditingAnimationStrength:(CGFloat)arg1{
+         if (isNoiconshakingEnable){
+            %orig(0);
+        }else{
+            %orig(arg1);
+        }
+    }
+
+%end
+
+//Lock-state transitions from the class that owns them (iOS 17 selectors verified
+//against the runtime dump; Logos silently skips wherever they don't exist).
+//The class is bound at %init time via objc_getClass.
 %group LockScreenTracker
 %hook SBLockScreenManager
-    //Fluid-14 ordering: on LOCK, setDeviceLocked (which runs the stock restore) MUST run
-    //BEFORE %orig - the pill's presentation config reads the fluid settings objects
-    //inside the lock machinery, and it has to see stock values there. On UNLOCK the old
-    //tail-first order is kept so the unlock machinery itself still runs through the
-    //locked (stock) pass-through, and the unlock grace starts right after.
     -(void)_setUILocked:(BOOL)arg1{
         if(arg1 && !deviceLocked) setDeviceLocked(YES, "_setUILocked(pre)");
         %orig;
@@ -1388,137 +403,57 @@ static BOOL inAppScalingSuppressed(void){ return inAppUIKitDepth > 0; }
 %end
 %end
 
-%hook CSCoverSheetTransitionSettings
-    -(BOOL)iconsFlyIn{ //fly in icon when unlock
-        if(isNoiconflyEnable){
-            return 0;
-        }else{
-            return %orig; //keep the system default (e.g. Respect Reduce Motion)
-        } 
-    }	
-%end
-
-%hook SBIconView
-
-    -(void)setEditingAnimationStrength:(CGFloat)arg1{
-         if (isNoiconshakingEnable){ 
-            %orig(0);
-        }else{
-            %orig(arg1);
-        }
-    }
-
-%end
-
-//Marks when SpringBoard finished launching so the boot grace (see note above) can end
-//adaptively instead of running a fixed 15s after every respring. The class only exists
-//in SpringBoard; Logos skips the hook everywhere else.
-%hook SpringBoard
-    - (void)applicationDidFinishLaunching:(id)application {
-        %orig;
-        springBoardDidFinishLaunchingTime = CFAbsoluteTimeGetCurrent();
-    }
-%end
-
-//Direct HUD presentation as extra trigger signals (class renamed to
-//SBVolumeControl on iOS 13+, so init the group with that class).
-//Several redundant triggers because selector availability differs between iOS
-//versions - Logos silently skips hooks whose selector doesn't exist.
-%group VolumeHUDExempt
-%hook VolumeControl
-    - (void)handleVolumeButtonWithType:(long long)arg1 down:(BOOL)arg2 { //hardware volume button press
-        noteVolumeHUDActivity();
-        %orig;
-    }
-    - (void)increaseVolume { //official SBVolumeControl API (iOS 13+)
-        noteVolumeHUDActivity();
-        %orig;
-    }
-    - (void)decreaseVolume { //official SBVolumeControl API (iOS 13+)
-        noteVolumeHUDActivity();
-        %orig;
-    }
-    - (void)_presentVolumeHUDWithVolume:(float)volume { //HUD is about to be presented (iOS 13-15)
-        noteVolumeHUDActivity();
-        %orig;
-    }
-    - (void)hideVolumeHUDIfVisible { //official SBVolumeControl API (iOS 13+)
-        noteVolumeHUDActivity();
-        %orig;
-    }
-%end
-%end
-
-%ctor { //More pref
-    tweakLoadTime = CFAbsoluteTimeGetCurrent(); //start of the 15s boot grace window (see note above)
+%ctor {
     isOnSpringBoard = [[[NSBundle mainBundle] bundleIdentifier] isEqual:@"com.apple.springboard"];
-    initStockMaps(); //Fluid-34: build maps+lock BEFORE any hook fires, so getter hooks never touch the dispatch_once gate (same-thread once-gate reentry = self-deadlock class)
+
+    initFolderDockMaps(); //build maps BEFORE any hook can fire (a dispatch_once gate
+                          //inside a hooked call path = same-thread reentry = self-deadlock
+                          //class, the Fluid-33/34 NSLock lesson)
 
     %init(_ungrouped); //activate all hooks outside explicit %groups
 
 	CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, (CFNotificationCallback)preferencesChanged, CFSTR("com.hoangdus.speedsterprefs-updated"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
 	preferencesChanged();
 
-	//Fluid-29: app-side diagnostics. The diag log used to be initialized only inside
-	//SpringBoard, so the [app-spring]/[app-ca] lines could NEVER appear even when the
-	//in-app hooks fired - in-app activity was invisible by construction. SpringBoard
-	//keeps its fresh-log-per-respring behavior; every other process appends to the
-	//same file (diagLogCore already opens in "a" mode, multi-process safe enough for
-	//diagnosis) with its own budget and a proof-of-injection line.
+	//Diagnostics. Injection is SpringBoard-only (Speedster.plist) since the Fresh
+	//rebuild has no in-app features - no multi-process log tearing, no sandbox
+	//write failures, no wasted injection.
 	diagLogPath = @"/var/mobile/Library/SpeedsterDiag.log";
-	diagBudget = isOnSpringBoard ? 500 : 300;
-	if (isOnSpringBoard) {
-		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring (SpringBoard only)
-		diagLog(@"Speedster Fluid-34 loaded in SpringBoard, deviceLocked(assumed)=%d", deviceLocked);
-		//Fluid-32 boot self-check: one line snapshot of install + feature state so a
-		//single respring confirms version, toggles and registry health from the log.
-		diagLog(@"[selfcheck] speed=%d slider=%lu fine=%d(%g) bounce=%d slider=%lu fine=%d(%g) | folder=%d speed=%g bounce=%d(%g) | inapp=%d speed=%g bounce=%d(%g) | switcherDismiss=%g", isSpeedEnable, (unsigned long)Speedvalue, isFineTuneSpeedEnable, FineTuneSpeedValue, isBounceEnable, (unsigned long)Bouncevalue, isFineTuneBounceEnable, FineTuneBounceValue, isFolderAnimationEnabled, FolderMassValue, isFolderAnimationBounceEnabled, FolderDampingValue, inAppAnimationEnabled, MassValue, inAppAnimationBounceEnabled, DampingValue, SwitcherDismiss);
+	diagBudget = 500;
+	remove(diagLogPath.fileSystemRepresentation); //fresh log per respring
+	diagLog(@"Speedster 2.2.0-Fresh-1 loaded in SpringBoard, deviceLocked(assumed)=%d", deviceLocked);
+	//boot self-check: one line snapshot of install + feature state
+	diagLog(@"[selfcheck] folder=%d speedSlider=%g bounce=%d slider=%g | fly=%d shake=%d nozoom=%d noWPzoom=%d",
+	        isFolderAnimationEnabled, FolderMassValue, isFolderAnimationBounceEnabled, FolderDampingValue,
+	        isNoiconflyEnable, isNoiconshakingEnable, isNoiconZoominSwitcher, isNoWallZoominSwitcher);
+
+	//Lock state tracking (gate only - see note above)
+	Class lockMgrClass = objc_getClass("SBLockScreenManager");
+	if (lockMgrClass) {
+		%init(LockScreenTracker, SBLockScreenManager = lockMgrClass);
+		diagLog(@"LockScreenTracker hooks initialized");
 	} else {
-		diagLog(@"Speedster Fluid-34 injected into app process: %@", [NSBundle mainBundle].bundleIdentifier);
+		diagLog(@"SBLockScreenManager class NOT found!");
+	}
+	watchLockState();
+	startLockPolling();
+
+	//Folder zoom acceleration (iOS 17 write-side mechanism - see FolderZoom note above)
+	Class folderAnimatorClass = objc_getClass("SBFolderIconZoomAnimator");
+	Class folderControllerClass = objc_getClass("SBFolderController");
+	if (folderAnimatorClass && folderControllerClass) {
+		%init(FolderZoom, SBFolderIconZoomAnimator = folderAnimatorClass, SBFolderController = folderControllerClass);
+		diagLog(@"FolderZoom hooks initialized (animator+controller found)");
+	} else {
+		diagLog(@"FolderZoom classes missing: animator=%p controller=%p", folderAnimatorClass, folderControllerClass);
 	}
 
-	if (isOnSpringBoard) {
-		//Volume changes made from SpringBoard (hardware buttons etc.) are announced
-		//right before the volume HUD presents - use that as the exemption window trigger.
-		//queue:nil is REQUIRED: an async queue would run this block only after the
-		//synchronous dispatch finishes, i.e. AFTER the HUD already configured its
-		//dismiss animation with the tweaked response value. Observers registered in
-		//%ctor run first (we register before SBVolumeControl does), so a synchronous
-		//block opens the window before the HUD configures its animations.
-		[[NSNotificationCenter defaultCenter] addObserverForName:@"AVSystemController_SystemVolumeDidChangeNotification" object:nil queue:nil usingBlock:^(NSNotification *note){
-			noteVolumeHUDActivity();
-		}];
-
-		%init(VolumeHUDExempt, VolumeControl = objc_getClass("SBVolumeControl"));
-
-		//Lock screen exemption wiring (see the lock exemption note above)
-		Class lockMgrClass = objc_getClass("SBLockScreenManager");
-		if (lockMgrClass) {
-			%init(LockScreenTracker, SBLockScreenManager = lockMgrClass);
-			diagLog(@"SBLockScreenTracker hooks initialized");
-		} else {
-			diagLog(@"SBLockScreenManager class NOT found!");
-		}
-		watchLockState();
-		startLockPolling();
-
-		//Folder zoom acceleration (iOS 17 write-side mechanism - see FolderZoom note above)
-		Class folderAnimatorClass = objc_getClass("SBFolderIconZoomAnimator");
-		Class folderControllerClass = objc_getClass("SBFolderController");
-		if (folderAnimatorClass && folderControllerClass) {
-			%init(FolderZoom, SBFolderIconZoomAnimator = folderAnimatorClass, SBFolderController = folderControllerClass);
-			diagLog(@"FolderZoom hooks initialized (animator+controller found)");
-		} else {
-			diagLog(@"FolderZoom classes missing: animator=%p controller=%p", folderAnimatorClass, folderControllerClass);
-		}
-
-		//Fluid-24: reversible layer animators carry the REAL zoom timing (BSAnimationSettings)
-		Class reversibleClass = objc_getClass("SBReversibleLayerPropertyAnimator");
-		if (reversibleClass) {
-			%init(ReversibleAnim, SBReversibleLayerPropertyAnimator = reversibleClass);
-			diagLog(@"ReversibleAnim hooks initialized");
-		} else {
-			diagLog(@"SBReversibleLayerPropertyAnimator NOT found");
-		}
+	//Reversible layer animators carry the REAL zoom timing (BSAnimationSettings)
+	Class reversibleClass = objc_getClass("SBReversibleLayerPropertyAnimator");
+	if (reversibleClass) {
+		%init(ReversibleAnim, SBReversibleLayerPropertyAnimator = reversibleClass);
+		diagLog(@"ReversibleAnim hooks initialized");
+	} else {
+		diagLog(@"SBReversibleLayerPropertyAnimator NOT found");
 	}
 }

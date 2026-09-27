@@ -146,15 +146,15 @@ jobs:
               sys.exit('no control file found in control.tar')
           m = re.search(r'^Version:\s*(\S+)', ctrl, re.M)
           version = m.group(1)
-          fm = re.search(r'(Fluid-\d+)', version)
+          fm = re.search(r'((?:Fresh|Fluid)-\d+)', version)
           if not fm:
-              sys.exit(f'control version has no Fluid tag: {version}')
+              sys.exit(f'control version has no Fresh/Fluid tag: {version}')
           tag = fm.group(1).encode()
           checks = {
               'dylib announces version': tag + b' loaded in SpringBoard' in dy or tag + b' injected into app process' in dy,
               'selfcheck line present': b'[selfcheck]' in dy,
               'folder SPRING trace present': b'SPRING k ' in dy,
-              'app-timed trace present': b'[app-timed]' in dy,
+              'no in-app animation hooks': b'[app-timed]' not in dy,
           }
           ok = True
           for k, v in checks.items():
