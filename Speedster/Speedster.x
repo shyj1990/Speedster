@@ -148,6 +148,14 @@ static NSMapTable *stockResponseValues;      //weak key: settings object -> NSNu
 static NSMapTable *stockDampingRatioValues;  //SBFFluidBehaviorSettings
 static NSMapTable *stockDampingValues;       //SBFAnimationSettings
 static NSMapTable *stockMassValues;
+//Fluid-32: restore used to rewrite EVERY registered object (282+ by Fluid-31) at
+//lock/unlock/HUD - pure no-op churn for objects the system itself set, and each
+//write fires the setter on objects that may be mid-animation (island pill flash
+//suspect). Track only objects we actually scaled; restore touches just those.
+static NSHashTable *touchedFluidResponse;
+static NSHashTable *touchedFluidDampingRatio;
+static NSHashTable *touchedAnimDamping;
+static NSHashTable *touchedAnimMass;
 static NSLock *stockValuesLock;
 static BOOL restoringForHUD = NO;
 
@@ -208,6 +216,10 @@ static void initStockMaps(void){
         stockValuesLock = [NSLock new];
         folderDockStockResponse = [NSMapTable mapTableWithKeyOptions:NSMapTableWeakMemory | NSMapTableObjectPointerPersonality valueOptions:NSMapTableStrongMemory];
         folderDockStockDamping = [NSMapTable mapTableWithKeyOptions:NSMapTableWeakMemory | NSMapTableObjectPointerPersonality valueOptions:NSMapTableStrongMemory];
+        touchedFluidResponse = [NSHashTable hashTableWithObjectsWithOptions:NSPointerFunctionsWeakMemory | NSPointerFunctionsObjectPersonality capacity:8];
+        touchedFluidDampingRatio = [NSHashTable hashTableWithObjectsWithOptions:NSPointerFunctionsWeakMemory | NSPointerFunctionsObjectPersonality capacity:8];
+        touchedAnimDamping = [NSHashTable hashTableWithObjectsWithOptions:NSPointerFunctionsWeakMemory | NSPointerFunctionsObjectPersonality capacity:8];
+        touchedAnimMass = [NSHashTable hashTableWithObjectsWithOptions:NSPointerFunctionsWeakMemory | NSPointerFunctionsObjectPersonality capacity:8];
     });
 }
 
@@ -224,30 +236,46 @@ static void recordStockValue(NSMapTable *map, id object, double value){
     [stockValuesLock unlock];
 }
 
+static void markTouched(NSHashTable *table, id object){
+    if (!isOnSpringBoard) return;
+    initStockMaps();
+    [stockValuesLock lock];
+    [table addObject:object];
+    [stockValuesLock unlock];
+}
+
 static void restoreStockValuesForHUD(NSString *reason){
     if (!isOnSpringBoard) return;
     initStockMaps();
-    diagLog(@"restore(%@): response=%lu dampingRatio=%lu damping=%lu mass=%lu", reason,
+    [stockValuesLock lock];
+    diagLog(@"restore(%@): touched response=%lu dr=%lu damping=%lu mass=%lu (registered %lu/%lu/%lu/%lu)", reason,
+            (unsigned long)[touchedFluidResponse count], (unsigned long)[touchedFluidDampingRatio count],
+            (unsigned long)[touchedAnimDamping count], (unsigned long)[touchedAnimMass count],
             (unsigned long)[stockResponseValues count], (unsigned long)[stockDampingRatioValues count],
             (unsigned long)[stockDampingValues count], (unsigned long)[stockMassValues count]);
-    [stockValuesLock lock];
     restoringForHUD = YES; //hooks pass straight through to %orig while restoring
-    for (id obj in stockResponseValues) {
+    //Fluid-32: iterate the touched set, not the full registry - an object the
+    //system set itself carries its own stock value and must not be rewritten.
+    for (id obj in touchedFluidResponse) {
         NSNumber *v = [stockResponseValues objectForKey:obj];
         if (v) [(id)obj setResponse:[v doubleValue]];
     }
-    for (id obj in stockDampingRatioValues) {
+    for (id obj in touchedFluidDampingRatio) {
         NSNumber *v = [stockDampingRatioValues objectForKey:obj];
         if (v) [(id)obj setDampingRatio:[v doubleValue]];
     }
-    for (id obj in stockDampingValues) {
+    for (id obj in touchedAnimDamping) {
         NSNumber *v = [stockDampingValues objectForKey:obj];
         if (v) [(id)obj setDamping:[v doubleValue]];
     }
-    for (id obj in stockMassValues) {
+    for (id obj in touchedAnimMass) {
         NSNumber *v = [stockMassValues objectForKey:obj];
         if (v) [(id)obj setMass:[v doubleValue]];
     }
+    [touchedFluidResponse removeAllObjects];
+    [touchedFluidDampingRatio removeAllObjects];
+    [touchedAnimDamping removeAllObjects];
+    [touchedAnimMass removeAllObjects];
     restoringForHUD = NO;
     [stockValuesLock unlock];
 }
@@ -622,6 +650,9 @@ static void folderScaleDockValue(id obj, BOOL isResponse, double mult){
         }
         if(isSpeedEnable){
             if(!isFineTuneSpeedEnable){
+                //Fluid-32: mark for touched-only restore (slider default case never scales;
+                //a stray no-op restore write for it is harmless)
+                markTouched(touchedFluidResponse, self);
                 //Change speed value base on selector pos
                 switch (Speedvalue){
                 case 1:
@@ -656,6 +687,7 @@ static void folderScaleDockValue(id obj, BOOL isResponse, double mult){
                     SwitcherDismiss = -1;
                     return;
                 }
+                markTouched(touchedFluidResponse, self); //Fluid-32: touched-only restore
                 %orig(reverseSpeedSliderValue(FineTuneSpeedValue));
                 //Check Speed Value and change SpringBoard and Switcher Dismiss speed accordingly
                 if (reverseSpeedSliderValue(FineTuneSpeedValue) < 0.4 && reverseSpeedSliderValue(FineTuneSpeedValue) >= 0.37){
@@ -709,6 +741,7 @@ static void folderScaleDockValue(id obj, BOOL isResponse, double mult){
         }
         if(isBounceEnable){
             if(!isFineTuneBounceEnable){
+                markTouched(touchedFluidDampingRatio, self); //Fluid-32: touched-only restore
                 switch (Bouncevalue){
                     case 1:
                         %orig(0.9);
@@ -734,6 +767,7 @@ static void folderScaleDockValue(id obj, BOOL isResponse, double mult){
                     %orig;
                     return;
                 }
+                markTouched(touchedFluidDampingRatio, self); //Fluid-32: touched-only restore
                 %orig(reverseBounceSliderValue(FineTuneBounceValue));
             }
         }else{
@@ -773,6 +807,7 @@ static void folderScaleDockValue(id obj, BOOL isResponse, double mult){
             %orig;
         }else{
             if(isFolderAnimationEnabled && isFolderAnimationBounceEnabled){
+                markTouched(touchedAnimDamping, self); //Fluid-32: touched-only restore
                 %orig(arg1*reverseFolderSliderValue(FolderDampingValue));
             }else{
                 %orig;
@@ -805,9 +840,11 @@ static void folderScaleDockValue(id obj, BOOL isResponse, double mult){
             return;
         }
         if(isInstantFolder){
+            markTouched(touchedAnimMass, self); //Fluid-32: touched-only restore
             %orig(arg1*0.0001);
         }else{
             if(isFolderAnimationEnabled){
+                markTouched(touchedAnimMass, self); //Fluid-32: touched-only restore
                 %orig(arg1*reverseFolderSliderValue(FolderMassValue));
             }else{
                 %orig;
@@ -1404,9 +1441,12 @@ static BOOL inAppScalingSuppressed(void){ return inAppUIKitDepth > 0; }
 	diagBudget = isOnSpringBoard ? 500 : 300;
 	if (isOnSpringBoard) {
 		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring (SpringBoard only)
-		diagLog(@"Speedster Fluid-31 loaded in SpringBoard, deviceLocked(assumed)=%d", deviceLocked);
+		diagLog(@"Speedster Fluid-32 loaded in SpringBoard, deviceLocked(assumed)=%d", deviceLocked);
+		//Fluid-32 boot self-check: one line snapshot of install + feature state so a
+		//single respring confirms version, toggles and registry health from the log.
+		diagLog(@"[selfcheck] speed=%d slider=%lu fine=%d(%g) bounce=%d slider=%lu fine=%d(%g) | folder=%d speed=%g bounce=%d(%g) | inapp=%d speed=%g bounce=%d(%g) | switcherDismiss=%g", isSpeedEnable, (unsigned long)Speedvalue, isFineTuneSpeedEnable, FineTuneSpeedValue, isBounceEnable, (unsigned long)Bouncevalue, isFineTuneBounceEnable, FineTuneBounceValue, isFolderAnimationEnabled, FolderMassValue, isFolderAnimationBounceEnabled, FolderDampingValue, inAppAnimationEnabled, MassValue, inAppAnimationBounceEnabled, DampingValue, SwitcherDismiss);
 	} else {
-		diagLog(@"Speedster Fluid-31 injected into app process: %@", [NSBundle mainBundle].bundleIdentifier);
+		diagLog(@"Speedster Fluid-32 injected into app process: %@", [NSBundle mainBundle].bundleIdentifier);
 	}
 
 	if (isOnSpringBoard) {

@@ -13,6 +13,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Iron rules check (pre-build)
+        run: python3 tools/check_rules.py Speedster/Speedster.x
+
       - name: Install Theos (roothide)
         run: |
           git clone --recursive https://github.com/roothide/theos.git $HOME/theos
@@ -82,6 +85,68 @@ jobs:
           if not any('slice1 [arm64e]' in r for r in results):
               sys.exit('no arm64e slice produced')
           print('all mach-o outputs verified')
+          EOF
+
+      - name: Verify package contents
+        run: |
+          python3 - << 'EOF'
+          import lzma, tarfile, io, struct, re, glob, sys
+
+          debs = glob.glob('Speedster/packages/*.deb')
+          if len(debs) != 1:
+              sys.exit(f'expected exactly 1 deb, found {len(debs)}')
+          data = open(debs[0], 'rb').read()
+          assert data[:8] == b'!<arch>\n', 'not a deb'
+
+          members, pos = {}, 8
+          while pos < len(data):
+              hdr = data[pos:pos+60]
+              if len(hdr) < 60: break
+              name = hdr[:16].decode().strip()
+              size = int(hdr[48:58].decode().strip())
+              members[name] = data[pos+60:pos+60+size]
+              pos += 60 + size + (size & 1)
+
+          raw = lzma.decompress(members['data.tar.lzma'])
+          tf = tarfile.open(fileobj=io.BytesIO(raw))
+          names = tf.getnames()
+          dylib = [n for n in names if n.endswith('Speedster.dylib')]
+          if not dylib:
+              sys.exit('no Speedster.dylib in package')
+          dy = tf.extractfile(dylib[0]).read()
+
+          fat = dy[:4] == b'\xca\xfe\xba\xbe'
+          slices = []
+          if fat:
+              for i in range(struct.unpack('>I', dy[4:8])[0]):
+                  ct, csub = struct.unpack('>II', dy[8+20*i:16+20*i])
+                  slices.append((ct, csub))
+          arm64  = any(c == 0x0100000C and (s & 0x00FFFFFF) != 2 for c, s in slices)
+          arm64e = any(c == 0x0100000C and (s & 0x00FFFFFF) == 2 for c, s in slices)
+          if not (fat and arm64 and arm64e):
+              sys.exit('FAT must contain arm64 + arm64e slices')
+
+          ctrl = tf.extractfile([n for n in names if n.endswith('./control') or n.endswith('/control')][0]).read().decode()
+          m = re.search(r'^Version:\s*(\S+)', ctrl, re.M)
+          version = m.group(1)
+          fm = re.search(r'(Fluid-\d+)', version)
+          if not fm:
+              sys.exit(f'control version has no Fluid tag: {version}')
+          tag = fm.group(1).encode()
+          checks = {
+              'dylib announces version': tag + b' loaded in SpringBoard' in dy or tag + b' injected into app process' in dy,
+              'selfcheck line present': b'[selfcheck]' in dy,
+              'folder SPRING trace present': b'SPRING k ' in dy,
+              'app-timed trace present': b'[app-timed]' in dy,
+          }
+          ok = True
+          for k, v in checks.items():
+              print(('PASS ' if v else 'FAIL ') + k)
+              ok = ok and v
+          print(f'package: {debs[0]} version {version}')
+          if not ok:
+              sys.exit('package verification FAILED')
+          print('package verification OK')
           EOF
 
       - name: Upload package artifact
