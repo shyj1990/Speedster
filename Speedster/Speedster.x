@@ -216,10 +216,10 @@ static void initStockMaps(void){
         stockValuesLock = [NSLock new];
         folderDockStockResponse = [NSMapTable mapTableWithKeyOptions:NSMapTableWeakMemory | NSMapTableObjectPointerPersonality valueOptions:NSMapTableStrongMemory];
         folderDockStockDamping = [NSMapTable mapTableWithKeyOptions:NSMapTableWeakMemory | NSMapTableObjectPointerPersonality valueOptions:NSMapTableStrongMemory];
-        touchedFluidResponse = [NSHashTable hashTableWithObjectsWithOptions:NSPointerFunctionsWeakMemory | NSPointerFunctionsObjectPersonality capacity:8];
-        touchedFluidDampingRatio = [NSHashTable hashTableWithObjectsWithOptions:NSPointerFunctionsWeakMemory | NSPointerFunctionsObjectPersonality capacity:8];
-        touchedAnimDamping = [NSHashTable hashTableWithObjectsWithOptions:NSPointerFunctionsWeakMemory | NSPointerFunctionsObjectPersonality capacity:8];
-        touchedAnimMass = [NSHashTable hashTableWithObjectsWithOptions:NSPointerFunctionsWeakMemory | NSPointerFunctionsObjectPersonality capacity:8];
+        touchedFluidResponse = [NSHashTable weakObjectsHashTable];
+        touchedFluidDampingRatio = [NSHashTable weakObjectsHashTable];
+        touchedAnimDamping = [NSHashTable weakObjectsHashTable];
+        touchedAnimMass = [NSHashTable weakObjectsHashTable];
     });
 }
 
