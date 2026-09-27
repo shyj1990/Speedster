@@ -2,7 +2,12 @@
 #import <Preferences/PSSwitchTableCell.h>
 #import <Preferences/PSSpecifier.h>
 
+@interface PSListController (Private)
+-(BOOL)containsSpecifier:(PSSpecifier *)arg1;
+@end
+
 @interface sdrRootListController : PSListController
+@property (nonatomic, retain) NSMutableDictionary *savedSpecifiers;
 @end
 
 @interface SpeedsterSwitchCell : PSSwitchTableCell
