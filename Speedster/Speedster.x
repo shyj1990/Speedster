@@ -320,6 +320,20 @@ static BOOL unlockGraceActive(void){
     return (CFAbsoluteTimeGetCurrent() - unlockTransitionTime) < 0.6;
 }
 
+//Fresh-5 LOCK-PREP GATE（锁屏准备门闸）：按锁屏键后 ~1.3s，_setUILocked 才翻转锁标志
+//（Fluid-15 冒烟枪；Fresh-4 日志实测 T-1.37s 读 backlightFadeDuration、T-1.27s 读
+//settlingDuration）。这段间隙里 deviceLocked 仍是 NO，所有缩放 setter 都活着，
+//灵动岛胶囊的过渡配置就在此时抓走了缩放弹簧值 → 冻结进私有副本 → 锁屏后 flip-flop
+//闪烁（Fluid-13 实锤：锁屏过渡期任何非 stock 弹簧值都会让胶囊状态机抖动；用户 A/B：
+//关「应用打开/关闭速度」闪烁消失）。武装信号 = 解锁期读到 backlightFadeDuration
+//（系统熄屏准备时自己的查询，整场日志仅此一处读点，无误报记录）。
+static CFAbsoluteTime lockPrepTime = 0;
+static BOOL lockPrepActive(void){
+    if (!isOnSpringBoard || deviceLocked || lockPrepTime == 0) return NO;
+    if ((CFAbsoluteTimeGetCurrent() - lockPrepTime) > 4.0){ lockPrepTime = 0; return NO; }
+    return YES;
+}
+
 static void diagLogCore(NSString *fmt, va_list args){
     if (!diagLogPath) return;
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
@@ -417,6 +431,7 @@ static void setDeviceLocked(BOOL locked, const char *source){
     diagLog(@"deviceLocked %d -> %d (%s)", deviceLocked, locked, source);
     deviceLocked = locked;
     if (!locked) unlockTransitionTime = CFAbsoluteTimeGetCurrent();
+    lockPrepTime = 0; //Fresh-5: stale prep arm must never leak across the unlock boundary
     diagBudget = 500; //fresh log budget per lock session
     unlockTraceBudget = 8; //fresh unlocked-read backtrace samples per session
     //Fresh-4: NO restore here - the Fresh-3 log nailed it: restore(lock) rewrote 277->
@@ -509,6 +524,11 @@ static void startLockPolling(void){
                 return;
             }
             if(unlockGraceActive()){ //Fluid-14: just-unlocked boundary stays stock
+                %orig;
+                return;
+            }
+            if(lockPrepActive()){ //Fresh-5: 锁屏准备窗口（T-1.3s）全 stock，胶囊过渡期禁毒
+                diagLogB(@"[lock-prep] setResponse %g passed stock (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self);
                 %orig;
                 return;
             }
@@ -608,6 +628,11 @@ static void startLockPolling(void){
                 %orig;
                 return;
             }
+            if(lockPrepActive()){ //Fresh-5: 锁屏准备窗口（T-1.3s）全 stock
+                diagLogB(@"[lock-prep] setDampingRatio %g passed stock (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self);
+                %orig;
+                return;
+            }
         }
         if(volumeHUDActive){ //stock volume HUD: keep untouched
             %orig;
@@ -671,6 +696,11 @@ static void startLockPolling(void){
                 %orig;
                 return;
             }
+            if(lockPrepActive()){ //Fresh-5: 锁屏准备窗口（T-1.3s）全 stock
+                diagLogB(@"[lock-prep] setDamping %g passed stock (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self);
+                %orig;
+                return;
+            }
         }
         if(volumeHUDActive){ //stock volume HUD: keep untouched
             %orig;
@@ -703,6 +733,11 @@ static void startLockPolling(void){
                 return;
             }
             if(unlockGraceActive()){ //Fluid-14: just-unlocked boundary stays stock
+                %orig;
+                return;
+            }
+            if(lockPrepActive()){ //Fresh-5: 锁屏准备窗口（T-1.3s）全 stock
+                diagLogB(@"[lock-prep] setMass %g passed stock (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self);
                 %orig;
                 return;
             }
@@ -786,6 +821,10 @@ static void startLockPolling(void){
             diagLogB(@"backlightFadeDuration -> stock %g (%@)", stock, NSStringFromClass([(id)self class]));
         }else{
             diagLogClassOnce(@"backlightFadeDuration", self, stock);
+            //Fresh-5: 解锁期读到此值 = 熄屏准备开始（锁屏键已按下）→ 立即武装全 stock 窗口。
+            //只记时间戳，不动返回值（铁律 #5：getter 永远不改值）。
+            lockPrepTime = CFAbsoluteTimeGetCurrent();
+            diagLogB(@"[lock-prep] armed by unlocked backlightFadeDuration read");
         }
         return stock;
     }
@@ -1167,7 +1206,7 @@ static void folderRestoreBSAnimSettings(id settings){
 		diagLogPath = @"/var/mobile/Library/SpeedsterDiag.log";
 		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring
 		diagBudget = 500; //budget for the pre-first-transition (locked after respring) session
-		diagLog(@"Speedster 2.2.0-Fresh-4 loaded in SpringBoard, deviceLocked(assumed)=%d", deviceLocked);
+		diagLog(@"Speedster 2.2.0-Fresh-5 loaded in SpringBoard, deviceLocked(assumed)=%d", deviceLocked);
 		//boot self-check: one line snapshot of install + feature state
 		diagLog(@"[selfcheck] speed=%d slider=%lu fine=%d(%g) bounce=%d slider=%lu fine=%d(%g) | folder=%d speed=%g bounce=%d(%g) | inapp=%d speed=%g bounce=%d(%g)",
 		        isSpeedEnable, (unsigned long)Speedvalue, isFineTuneSpeedEnable, FineTuneSpeedValue,
