@@ -140,6 +140,16 @@ static void startLockPolling(void){
     dispatch_resume(lockPollTimer);
 }
 
+//Silence the compiler: these setters exist at runtime on the fluid/animation
+//settings objects (SBFFluidBehaviorSettings / SBFAnimationSettings) but are not
+//declared in any public header.
+@interface NSObject (SpeedsterFluidSettings)
+- (void)setResponse:(double)arg1;
+- (void)setDampingRatio:(double)arg1;
+- (void)setDamping:(double)arg1;
+- (void)setMass:(double)arg1;
+@end
+
 //Folder dock spring acceleration (Fluid-22, field-verified) --------------------
 //The real zoom spring object is [SBFolderIconZoomAnimator dockAnimationSettings]
 //(SBFFluidBehaviorSettings response 0.531 / dampingRatio 0.845) and it is created
