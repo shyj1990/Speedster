@@ -419,13 +419,13 @@ static void setDeviceLocked(BOOL locked, const char *source){
     if (!locked) unlockTransitionTime = CFAbsoluteTimeGetCurrent();
     diagBudget = 500; //fresh log budget per lock session
     unlockTraceBudget = 8; //fresh unlocked-read backtrace samples per session
-    //Fluid-14: the lock pill's animation config is read INSIDE %orig of the lock call,
-    //i.e. BEFORE this function used to run at the hook's tail - so every lock started
-    //with the pill reading unlock-period tweaked object values and freezing them into
-    //its own presentation state (the endless silent flash). On LOCK the restore must
-    //run BEFORE the lock machinery; the SBLockScreenManager hooks below were reordered
-    //accordingly. This function stays as the authoritative state/restore entry.
-    restoreStockValuesForHUD(locked ? @"lock" : @"unlock");
+    //Fresh-4: NO restore here - the Fresh-3 log nailed it: restore(lock) rewrote 277->
+    //381->492 live objects at EVERY lock transition (registry bloat: recordStockValue
+    //ran before the guard chain, so every pass-through object entered the registry).
+    //That synchronous mass-rewrite colliding with in-flight island pill animations is
+    //the last standing flash mechanism. Lock/unlock transitions now write NOTHING;
+    //getter hooks never touch values; only short-lived app-animation objects get
+    //scaled (and only while unlocked).
 }
 
 static void lockCompleteDarwinCallback(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo){
@@ -501,8 +501,8 @@ static void startLockPolling(void){
                 %orig;
                 return;
             }
-            diagLogB(@"[fluid-lifecycle] setResponse %g age=%.2fs self=%p", arg1, age, self);
-            recordStockValue(stockResponseValues, self, arg1);
+            static int lifecycleLogCount = 0; //Fresh-4: budget the hot-path noise
+            if (lifecycleLogCount < 80) { lifecycleLogCount++; diagLogB(@"[fluid-lifecycle] setResponse %g age=%.2fs self=%p", arg1, age, self); }
             diagLogClassOnce(@"setResponse", self, arg1);
             if(bootGraceActive()){
                 %orig;
@@ -523,6 +523,7 @@ static void startLockPolling(void){
             return;
         }
         if(isSpeedEnable){
+            recordStockValue(stockResponseValues, self, arg1); //Fresh-4: record ONLY right before scaling - registry holds just the objects we actually touched
             if(!isFineTuneSpeedEnable){
                 //Change speed value base on selector pos
                 switch (Speedvalue){
@@ -596,8 +597,8 @@ static void startLockPolling(void){
                 %orig;
                 return;
             }
-            diagLogB(@"[fluid-lifecycle] setDampingRatio %g age=%.2fs self=%p", arg1, age, self);
-            recordStockValue(stockDampingRatioValues, self, arg1);
+            static int lifecycleLogCountD = 0; //Fresh-4: budget the hot-path noise
+            if (lifecycleLogCountD < 80) { lifecycleLogCountD++; diagLogB(@"[fluid-lifecycle] setDampingRatio %g age=%.2fs self=%p", arg1, age, self); }
             diagLogClassOnce(@"setDampingRatio", self, arg1);
             if(bootGraceActive()){
                 %orig;
@@ -618,6 +619,7 @@ static void startLockPolling(void){
             return;
         }
         if(isBounceEnable){
+            recordStockValue(stockDampingRatioValues, self, arg1); //Fresh-4: record ONLY right before scaling
             if(!isFineTuneBounceEnable){
                 switch (Bouncevalue){
                     case 1:
@@ -1165,7 +1167,7 @@ static void folderRestoreBSAnimSettings(id settings){
 		diagLogPath = @"/var/mobile/Library/SpeedsterDiag.log";
 		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring
 		diagBudget = 500; //budget for the pre-first-transition (locked after respring) session
-		diagLog(@"Speedster 2.2.0-Fresh-3 loaded in SpringBoard, deviceLocked(assumed)=%d", deviceLocked);
+		diagLog(@"Speedster 2.2.0-Fresh-4 loaded in SpringBoard, deviceLocked(assumed)=%d", deviceLocked);
 		//boot self-check: one line snapshot of install + feature state
 		diagLog(@"[selfcheck] speed=%d slider=%lu fine=%d(%g) bounce=%d slider=%lu fine=%d(%g) | folder=%d speed=%g bounce=%d(%g) | inapp=%d speed=%g bounce=%d(%g)",
 		        isSpeedEnable, (unsigned long)Speedvalue, isFineTuneSpeedEnable, FineTuneSpeedValue,
