@@ -126,20 +126,24 @@ jobs:
           if not (fat and arm64 and arm64e):
               sys.exit('FAT must contain arm64 + arm64e slices')
 
-          # control file lives in control.tar.lzma, not data.tar.lzma
-          ctrl_raw = lzma.decompress(members.get('control.tar.lzma', members.get('control.tar.gz', b'')))
-          if ctrl_raw:
-              ct = tarfile.open(fileobj=io.BytesIO(ctrl_raw))
-              ctrl_members = [n for n in ct.getnames() if n.endswith('./control') or n.endswith('/control') or n == 'control']
-              if ctrl_members:
-                  ctrl = ct.extractfile(ctrl_members[0]).read().decode()
-              else:
-                  ctrl = ''
-              ct.close()
-          else:
-              ctrl = ''
+          # control file lives in control.tar (lzma or gz), not data.tar.lzma
+          ctrl = ''
+          for mname in ('control.tar.lzma', 'control.tar.gz', 'control.tar'):
+              if mname in members:
+                  raw = members[mname]
+                  if mname.endswith('.lzma'):
+                      raw = lzma.decompress(raw)
+                  elif mname.endswith('.gz'):
+                      import gzip
+                      raw = gzip.decompress(raw)
+                  ct = tarfile.open(fileobj=io.BytesIO(raw))
+                  ctrl_members = [n for n in ct.getnames() if n.endswith('./control') or n.endswith('/control') or n == 'control']
+                  if ctrl_members:
+                      ctrl = ct.extractfile(ctrl_members[0]).read().decode()
+                  ct.close()
+                  if ctrl: break
           if not ctrl:
-              sys.exit('no control file found in control.tar.lzma/gz')
+              sys.exit('no control file found in control.tar')
           m = re.search(r'^Version:\s*(\S+)', ctrl, re.M)
           version = m.group(1)
           fm = re.search(r'(Fluid-\d+)', version)
