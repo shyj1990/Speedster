@@ -244,7 +244,7 @@ static void markTouched(NSHashTable *table, id object){
     [stockValuesLock unlock];
 }
 
-static void restoreStockValuesForHUD(NSString *reason){
+__attribute__((unused)) static void restoreStockValuesForHUD(NSString *reason){
     if (!isOnSpringBoard) return;
     initStockMaps();
     [stockValuesLock lock];
