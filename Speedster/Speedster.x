@@ -495,7 +495,8 @@ static NSMutableDictionary *scaleWatchSeen;
 static BOOL scaleWatchFirst(NSString *tag, double value){
     if (!scaleWatchSeen) scaleWatchSeen = [NSMutableDictionary new];
     NSString *key = [NSString stringWithFormat:@"%@|%.4f", tag, value];
-    long c = scaleWatchSeen[key] ? scaleWatchSeen[key].longValue + 1 : 1;
+    NSNumber *n = scaleWatchSeen[key];
+    long c = n ? n.longValue + 1 : 1;
     scaleWatchSeen[key] = @(c);
     if (c == 50 || c == 200 || c == 800)
         diagLogB(@"[scale-watch] %@|%.4f milestone x%ld", tag, value, c);
