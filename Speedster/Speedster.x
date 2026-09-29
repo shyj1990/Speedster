@@ -395,13 +395,32 @@ static void stormGuardNoteCall(void){
 //把紧随其后的 App 开关动画配置全吞成 stock，速度全灭。伴随值风险评估：(0,0) 缩放
 //是无操作，(0.336,1) 临界阻尼不震荡非循环驱动源 → 拆掉窗口只留精确值门闸，App 速度
 //恢复且岛修复不受损（冻结毒药的主体就是被加速的 0.531 主弹簧）。
-//新增 [scale-watch]（200 行预算）：记录每次真正走到缩放的调用（值+类），缩放可观测。
+//Fluid-38（Fluid-3 日志全量取证）：scale-watch 200 行全被岛爆发吃光（45+65+34+56），
+//值分布 setResponse: 0.319081×54 / 0.189737×49 / 0.417267×35 / 0.336×17 / 0.465467×15 /
+//0.55×15 / 0×14 / 0.25×1，且 setDampingRatio 全程缩放 0 次 → 循环只跑在 response 侧。
+//计算值精确重复（本机常量而非连续变量），同一对象同簇内被重设 3~4 次 = 循环由 setter
+//直接再驱动。0.189737/0.25 是自家写出的预设值被读回再喂（输出恒定故无复合放大，无害）。
+//App 家族 response≈0.457 与上述全部毒值间距 ≥0.0085（最近的 0.465467），±0.005 门闸不
+//侵犯 → 六值 0.336/0/0.319081/0.417267/0.465467/0.55 全部永不缩放（isIslandCalcResponse）。
+//[scale-watch] 改为唯一 (selector, 输入值 4dp) 首见才记 + 计数里程碑，不再被爆发饿死，
+//App 开关签名这次必被记录；门闸值与缩放值首见时都采 [scale-bt]/[island-gate] 调用链
+//（image!offset），为 Fluid-5 白名单收集调用方指纹（岛 vs App 转场的 caller 分野）。
 #define ISLAND_RESP 0.531
 #define ISLAND_DAMP 0.845
 #define ISLAND_EPS 0.005
 static NSInteger islandLogBudget = 120;
 static NSInteger lockedLogBudget = 30;
-static NSInteger scaleWatchBudget = 200;
+static NSInteger scaleWatchBudget = 200; //Fluid-38: 首见才扣，全程有效
+
+//Fluid-38: Fluid-3 实测岛计算值家族（响应侧）。全部与 app 家族 0.457 分离。
+static BOOL isIslandCalcResponse(double v){
+    return fabs(v - 0.336)    < ISLAND_EPS
+        || fabs(v)            < ISLAND_EPS   //0：岛爆发伴随值（stock 写 0 即其本意）
+        || fabs(v - 0.319081) < ISLAND_EPS
+        || fabs(v - 0.417267) < ISLAND_EPS
+        || fabs(v - 0.465467) < ISLAND_EPS
+        || fabs(v - 0.55)     < ISLAND_EPS;
+}
 
 static void diagLogCore(NSString *fmt, va_list args){
     if (!diagLogPath) return;
@@ -444,12 +463,13 @@ static void diagLogB(NSString *fmt, ...){
 //tweak's hook trampoline frames (Fluid-14 SymMap analysis proved the "SpringBoard"
 //frames in storm traces are trampolines), but who-calls-whom is still readable.
 static NSInteger unlockTraceBudget = 0;
-static void unlockSampleTrace(NSString *tag, double value){
-    if (!isOnSpringBoard || deviceLocked || unlockTraceBudget <= 0) return;
-    unlockTraceBudget--;
+//Fluid-38: 采样核心（原 unlock-read 逻辑逐字保留，仅参数化 group/budget 供 scale-bt 复用）。
+static void sampleTraceCore(NSString *group, NSString *name, double value, NSInteger *budget){
+    if (!isOnSpringBoard || deviceLocked || *budget <= 0) return;
+    (*budget)--;
     void *frames[32] = {0};
     int n = backtrace(frames, 32);
-    NSMutableString *line = [NSMutableString stringWithFormat:@"[unlock-read] %@ value=%g (%d frames):", tag, value, n];
+    NSMutableString *line = [NSMutableString stringWithFormat:@"[%@] %@ value=%g (%d frames):", group, name, value, n];
     for (int i = 2; i < n && i < 16; i++) {
         Dl_info info;
         memset(&info, 0, sizeof(info));
@@ -462,6 +482,24 @@ static void unlockSampleTrace(NSString *tag, double value){
         [line appendFormat:@" <- %@", raw];
     }
     diagLog(@"%@", line);
+}
+static void unlockSampleTrace(NSString *tag, double value){
+    sampleTraceCore(@"unlock-read", tag, value, &unlockTraceBudget);
+}
+
+//Fluid-38 scale-watch 去重 + 首见调用链采样。fluid setter 均主线程（Fluid-35 实证），
+//seen 表免锁；key 进程生命周期累积（唯一值只记一次），计数到 50/200/800 打里程碑。
+//预算：首见日志走 diagLogB（500/锁会话）；调用链走独立 24 次预算（不随锁会话重置）。
+static NSInteger scaleBtBudget = 24;
+static NSMutableDictionary *scaleWatchSeen;
+static BOOL scaleWatchFirst(NSString *tag, double value){
+    if (!scaleWatchSeen) scaleWatchSeen = [NSMutableDictionary new];
+    NSString *key = [NSString stringWithFormat:@"%@|%.4f", tag, value];
+    long c = scaleWatchSeen[key] ? scaleWatchSeen[key].longValue + 1 : 1;
+    scaleWatchSeen[key] = @(c);
+    if (c == 50 || c == 200 || c == 800)
+        diagLogB(@"[scale-watch] %@|%.4f milestone x%ld", tag, value, c);
+    return c == 1;
 }
 
 //Fluid-8 unlocked-phase sampling: one line per (selector, class) pair. The flash loop
@@ -611,8 +649,11 @@ static void startLockPolling(void){
             %orig;
             return;
         }
-        if(fabs(arg1 - ISLAND_RESP) < ISLAND_EPS){ //Fluid-36: 岛预设签名 response 0.531 永不缩放
-            if (islandLogBudget > 0){ islandLogBudget--; diagLogB(@"[island-preset] setResponse %g passed stock (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self); }
+        if(fabs(arg1 - ISLAND_RESP) < ISLAND_EPS || isIslandCalcResponse(arg1)){ //Fluid-36/38: 岛签名+计算值家族永不缩放
+            if (scaleWatchFirst(@"island-gate", arg1)){ //Fluid-38: 首见才记日志+采调用链
+                if (islandLogBudget > 0){ islandLogBudget--; diagLogB(@"[island-preset] setResponse %g passed stock (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self); }
+                sampleTraceCore(@"island-gate", @"setResponse", arg1, &scaleBtBudget);
+            }
             %orig;
             return;
         }
@@ -622,7 +663,10 @@ static void startLockPolling(void){
             return;
         }
         if(isSpeedEnable){
-            if (scaleWatchBudget > 0){ scaleWatchBudget--; diagLogB(@"[scale-watch] setResponse %g scaled (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self); }
+            if (scaleWatchFirst(@"R", arg1)){ //Fluid-38: 唯一值首见才记，爆发不再吃光预算
+                if (scaleWatchBudget > 0){ scaleWatchBudget--; diagLogB(@"[scale-watch] setResponse %g scaled first (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self); }
+                sampleTraceCore(@"scale-bt", @"setResponse", arg1, &scaleBtBudget);
+            }
             stormGuardNoteCall(); //Fluid-35: 缩放级调用入环形缓冲（判岛循环）
             recordStockValue(stockResponseValues, self, arg1); //Fresh-4: record ONLY right before scaling - registry holds just the objects we actually touched
             if(!isFineTuneSpeedEnable){
@@ -735,7 +779,10 @@ static void startLockPolling(void){
             return;
         }
         if(isBounceEnable){
-            if (scaleWatchBudget > 0){ scaleWatchBudget--; diagLogB(@"[scale-watch] setDampingRatio %g scaled (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self); }
+            if (scaleWatchFirst(@"D", arg1)){ //Fluid-38: 唯一值首见才记，爆发不再吃光预算
+                if (scaleWatchBudget > 0){ scaleWatchBudget--; diagLogB(@"[scale-watch] setDampingRatio %g scaled first (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self); }
+                sampleTraceCore(@"scale-bt", @"setDampingRatio", arg1, &scaleBtBudget);
+            }
             stormGuardNoteCall(); //Fluid-35: 缩放级调用入环形缓冲（判岛循环）
             recordStockValue(stockDampingRatioValues, self, arg1); //Fresh-4: record ONLY right before scaling
             if(!isFineTuneBounceEnable){
@@ -1299,7 +1346,7 @@ static void folderRestoreBSAnimSettings(id settings){
 		diagLogPath = @"/var/mobile/Library/SpeedsterDiag.log";
 		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring
 		diagBudget = 500; //budget for the pre-first-transition (locked after respring) session
-		diagLog(@"Speedster 2.1.5-Fluid-3 loaded in SpringBoard, deviceLocked(assumed)=%d", deviceLocked);
+		diagLog(@"Speedster 2.1.5-Fluid-4 loaded in SpringBoard, deviceLocked(assumed)=%d", deviceLocked);
 		//boot self-check: one line snapshot of install + feature state
 		diagLog(@"[selfcheck] speed=%d slider=%lu fine=%d(%g) bounce=%d slider=%lu fine=%d(%g) | folder=%d speed=%g bounce=%d(%g) | inapp=%d speed=%g bounce=%d(%g)",
 		        isSpeedEnable, (unsigned long)Speedvalue, isFineTuneSpeedEnable, FineTuneSpeedValue,
