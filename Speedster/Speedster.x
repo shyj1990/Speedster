@@ -388,25 +388,20 @@ static void stormGuardNoteCall(void){
 //救不了已冻结副本（Fluid-15 T-1.3s 间隙同款病）。必须在毒药写入点拦截。
 //日志数值分布实证：response 0.531 / dampingRatio 0.845 是岛/锁胶囊/dock 家族签名
 //（locked 期 236+236 次全成对、boot 期 43+48 次成对、Fluid-35 跳闸爆发 16 对象同签名），
-//app 开关家族 response≈0.457 与之明显分离。对这两个精确值（±0.005）永不缩放；
-//任一签名出现后开 300ms 窗口，同爆发的伴生对象（如 0.336/1）也全 stock。
-//误伤面 = 恰好用这两个值的动画跑原版速度（数值特征极窄，方向永远安全）。
+//app 开关家族 response≈0.457 与之明显分离。对这两个精确值（±0.005）永不缩放。
 //文件夹 dock 同签名但不受损：文件夹机制带 restoringForHUD 走独立显式缩放。
+//Fluid-37 教训（用户实测 Fluid-2 后"应用打开/关闭失效"）：Fluid-2 曾在签名出现后开
+//300ms 伴随窗口——但开 App 时岛收缩转场本身必发签名（岛与 App 转场时间耦合），窗口
+//把紧随其后的 App 开关动画配置全吞成 stock，速度全灭。伴随值风险评估：(0,0) 缩放
+//是无操作，(0.336,1) 临界阻尼不震荡非循环驱动源 → 拆掉窗口只留精确值门闸，App 速度
+//恢复且岛修复不受损（冻结毒药的主体就是被加速的 0.531 主弹簧）。
+//新增 [scale-watch]（200 行预算）：记录每次真正走到缩放的调用（值+类），缩放可观测。
 #define ISLAND_RESP 0.531
 #define ISLAND_DAMP 0.845
 #define ISLAND_EPS 0.005
-#define ISLAND_BURST_SECS 0.30
-static CFAbsoluteTime islandBurstUntil = 0;
 static NSInteger islandLogBudget = 120;
 static NSInteger lockedLogBudget = 30;
-
-static BOOL islandBurstActive(void){
-    return CFAbsoluteTimeGetCurrent() < islandBurstUntil;
-}
-
-static void islandBurstNote(void){
-    islandBurstUntil = CFAbsoluteTimeGetCurrent() + ISLAND_BURST_SECS;
-}
+static NSInteger scaleWatchBudget = 200;
 
 static void diagLogCore(NSString *fmt, va_list args){
     if (!diagLogPath) return;
@@ -618,13 +613,6 @@ static void startLockPolling(void){
         }
         if(fabs(arg1 - ISLAND_RESP) < ISLAND_EPS){ //Fluid-36: 岛预设签名 response 0.531 永不缩放
             if (islandLogBudget > 0){ islandLogBudget--; diagLogB(@"[island-preset] setResponse %g passed stock (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self); }
-            islandBurstNote();
-            %orig;
-            return;
-        }
-        if(islandBurstActive()){ //Fluid-36: 岛呈现爆发窗口内的伴生对象全 stock
-            if (islandLogBudget > 0){ islandLogBudget--; diagLogB(@"[island-preset] burst: setResponse %g passed stock (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self); }
-            islandBurstNote(); //窗口内存活调用刷新窗口，爆发整体覆盖
             %orig;
             return;
         }
@@ -634,6 +622,7 @@ static void startLockPolling(void){
             return;
         }
         if(isSpeedEnable){
+            if (scaleWatchBudget > 0){ scaleWatchBudget--; diagLogB(@"[scale-watch] setResponse %g scaled (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self); }
             stormGuardNoteCall(); //Fluid-35: 缩放级调用入环形缓冲（判岛循环）
             recordStockValue(stockResponseValues, self, arg1); //Fresh-4: record ONLY right before scaling - registry holds just the objects we actually touched
             if(!isFineTuneSpeedEnable){
@@ -737,13 +726,6 @@ static void startLockPolling(void){
         }
         if(fabs(arg1 - ISLAND_DAMP) < ISLAND_EPS){ //Fluid-36: 岛预设签名 dampingRatio 0.845 永不缩放
             if (islandLogBudget > 0){ islandLogBudget--; diagLogB(@"[island-preset] setDampingRatio %g passed stock (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self); }
-            islandBurstNote();
-            %orig;
-            return;
-        }
-        if(islandBurstActive()){ //Fluid-36: 岛呈现爆发窗口内的伴生对象全 stock
-            if (islandLogBudget > 0){ islandLogBudget--; diagLogB(@"[island-preset] burst: setDampingRatio %g passed stock (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self); }
-            islandBurstNote(); //窗口内存活调用刷新窗口，爆发整体覆盖
             %orig;
             return;
         }
@@ -753,6 +735,7 @@ static void startLockPolling(void){
             return;
         }
         if(isBounceEnable){
+            if (scaleWatchBudget > 0){ scaleWatchBudget--; diagLogB(@"[scale-watch] setDampingRatio %g scaled (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self); }
             stormGuardNoteCall(); //Fluid-35: 缩放级调用入环形缓冲（判岛循环）
             recordStockValue(stockDampingRatioValues, self, arg1); //Fresh-4: record ONLY right before scaling
             if(!isFineTuneBounceEnable){
@@ -1316,7 +1299,7 @@ static void folderRestoreBSAnimSettings(id settings){
 		diagLogPath = @"/var/mobile/Library/SpeedsterDiag.log";
 		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring
 		diagBudget = 500; //budget for the pre-first-transition (locked after respring) session
-		diagLog(@"Speedster 2.1.5-Fluid-2 loaded in SpringBoard, deviceLocked(assumed)=%d", deviceLocked);
+		diagLog(@"Speedster 2.1.5-Fluid-3 loaded in SpringBoard, deviceLocked(assumed)=%d", deviceLocked);
 		//boot self-check: one line snapshot of install + feature state
 		diagLog(@"[selfcheck] speed=%d slider=%lu fine=%d(%g) bounce=%d slider=%lu fine=%d(%g) | folder=%d speed=%g bounce=%d(%g) | inapp=%d speed=%g bounce=%d(%g)",
 		        isSpeedEnable, (unsigned long)Speedvalue, isFineTuneSpeedEnable, FineTuneSpeedValue,
