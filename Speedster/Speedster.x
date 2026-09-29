@@ -347,7 +347,7 @@ static BOOL lockPrepActive(void){
 //实证 stock 永不闪）。误报代价 = 几秒原版动画（与 lock-prep 同哲学，方向永远安全）。
 //armed 期间只透传不分析，3.5s 后若循环仍活着会重新武装（自愈）。
 #define STORM_WIN_SECS 1.6
-#define STORM_MIN_CALLS 16
+#define STORM_MIN_CALLS 32 //Fluid-40: 16→32 降敏为最后兜底（循环由值级 loop-breaker 精准压制）
 #define STORM_MIN_SPAN 1.2
 #define STORM_ARM_SECS 3.5
 static CFAbsoluteTime stormGuardUntil = 0;
@@ -412,24 +412,63 @@ static NSInteger islandLogBudget = 120;
 static NSInteger lockedLogBudget = 30;
 static NSInteger scaleWatchBudget = 200; //Fluid-38: 首见才扣，全程有效
 
-//Fluid-39（Fluid-4 日志裁决，App 速度恢复版）：Fluid-4 六值门闸止闪但杀 App 速度。
-//带回的 [island-gate]/[scale-bt] 调用链指纹揭示三链分野：
-//  岛呈现链（0.531/0.336/0）：共享特征帧 SpringBoard!0x5f4a3c/0x74d7a8/0x74c4c8；
-//  App 转场链（0.417267/0.465467/0.55）：SpringBoard!0x6bfxxx→0x1f2f2c→0x1c8xxx/0x1c9xxx，
-//    且 0.4655~0.4699 出现连续漂移变体（0.465799/0.466703/0.467378/0.469861）+ 0.47144
-//    差 0.0006 漏网被缩放 = 拖拽/转场手势连续插值族，是 App 开关动画主力弹簧；
-//  独立第三链（0.319081）：0x36xxxx/0x70xxxx/0x6ac300/0x447938。
-//复查 Fluid-3 时间线：岛循环本体 = 0.319081 族（同对象 3ms 重复 = 循环铁证）；而
-//0.417267/0.465467/0.55 簇（t+1.5/t+14）无循环特征，实为测试期间的用户 App 转场
-//（Fluid-3 中它们被缩放且 App 速度正常 = 佐证）。
-//→ 门闸收窄为三值 0.336/0/0.319081（岛呈现伴随+循环本体），放行 App 转场三族。
-//残留风险：App 期 0.319081（第三链）被拦，若 App 某子动画依赖它则局部恢复原速；
-//若岛仍闪 → 0.417267/0.465467/0.55 的岛期链样本会进下份日志，Fluid-6 按链指纹终裁。
-//Fluid-38: Fluid-3 实测岛计算值家族（响应侧）。全部与 app 家族 0.457 分离。
-static BOOL isIslandCalcResponse(double v){
-    return fabs(v - 0.336)    < ISLAND_EPS
-        || fabs(v)            < ISLAND_EPS   //0：岛爆发伴随值（stock 写 0 即其本意）
-        || fabs(v - 0.319081) < ISLAND_EPS;
+static void diagLog(NSString *fmt, ...); //Fluid-40: 前向声明（loop-breaker 块位于 diagLog 定义之前）
+//Fluid-40（Fluid-5 日志终裁）：三链指纹证伪——链2(0x36xxxx) 同时承载岛循环的
+//0.319081 与 App 期 0.300348/0.301082；链3(0x6bfxxx) 同时承载岛循环启动的 0.417267/
+//0.465467/0.55（7690.17 循环启动触发 ARM）与 App 期 0.397667/0.153143/0.1554。
+//调用方代码层面岛循环与 App 转场不分家 → 链指纹死路。Fluid-5 的"岛不闪"实为 storm-guard
+//压制（back-to-back ARMED 4 次，7714-7728 循环持续 16-32 calls/1.3s），App 转场主体弹簧
+//（0.336/0.319081 被 island-gate 拦 + 0.465 族被 storm 拦）全 stock → App 慢。
+//Fluid-3 岛闪+App 快同代的唯一调和 = 循环与转场同值不同节奏：循环 = 同值持续重复
+//（爆发 24 次/48ms 或持续 16-32 次/1.3s），App 转场 = 同值 1-2 次/次、人手节拍
+//（Fluid-5 日志实证单次 App 开关 = 1-4 次缩放级调用）。
+//→ Fluid-6 拆全部值门闸（0 除外：response 0 = 瞬时语义，缩放它=把瞬时变 0.19，纯错误），
+//新增值级 LOOP-BREAKER 双窗：快窗 6 次/0.3s（抓爆发循环）+ 慢窗 12 次/1.2s（抓持续循环），
+//任一触发 → 该值 ARM 8s 全对象 stock（ARM 期清窗重累计；App 手速永远够不到阈值）。
+//storm-guard 全局阈值 16→32 降敏为最后兜底。
+static NSMutableDictionary *lbTimes;   // key=值4dp -> NSMutableArray(CFAbsoluteTime)
+static NSMutableDictionary *lbArmed;   // key=值4dp -> NSNumber(until)
+static NSInteger lbLogBudget = 40;
+#define LB_FAST_WIN 0.3
+#define LB_FAST_N 6
+#define LB_SLOW_WIN 1.2
+#define LB_SLOW_N 12
+#define LB_ARM_SECS 8.0
+static NSString *lbKey(double v){ return [NSString stringWithFormat:@"%.4f", v]; }
+static BOOL loopBreakerActive(double v){
+    if (!isOnSpringBoard) return NO;
+    NSNumber *until = lbArmed[lbKey(v)];
+    return until && until.doubleValue > CFAbsoluteTimeGetCurrent();
+}
+static void loopBreakerNote(double v){
+    if (!isOnSpringBoard) return;
+    if (!lbTimes) lbTimes = [NSMutableDictionary new];
+    if (lbTimes.count > 64){ [lbTimes removeAllObjects]; } //防御
+    NSString *k = lbKey(v);
+    NSMutableArray *arr = lbTimes[k];
+    if (!arr){ arr = [NSMutableArray array]; lbTimes[k] = arr; }
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    [arr addObject:@(now)];
+    NSMutableIndexSet *drop = [NSMutableIndexSet indexSet];
+    for (NSUInteger i = 0; i < arr.count; i++){
+        if (now - arr[i].doubleValue > LB_SLOW_WIN) [drop addIndex:i];
+    }
+    if (drop.count) [arr removeObjectsAtIndexes:drop];
+    BOOL fast = NO, slow = NO;
+    if (arr.count >= LB_SLOW_N){ //窗外项刚清掉，剩余全在慢窗内
+        slow = YES;
+        NSInteger fastCnt = 0;
+        for (NSNumber *t in arr) if (now - t.doubleValue <= LB_FAST_WIN) fastCnt++;
+        fast = fastCnt >= LB_FAST_N;
+    }
+    if (fast || slow){
+        lbArmed = lbArmed ?: [NSMutableDictionary new];
+        lbArmed[k] = @(now + LB_ARM_SECS);
+        [arr removeAllObjects]; //ARM 后清窗，到期凭新调用重新累计
+        if (lbLogBudget > 0){ lbLogBudget--;
+            diagLog(@"[loop-break] ARMED value=%g (%s) — value stock for %.0fs", v, fast?"fast":"slow", (double)LB_ARM_SECS);
+        }
+    }
 }
 
 static void diagLogCore(NSString *fmt, va_list args){
@@ -660,7 +699,7 @@ static void startLockPolling(void){
             %orig;
             return;
         }
-        if(fabs(arg1 - ISLAND_RESP) < ISLAND_EPS || isIslandCalcResponse(arg1)){ //Fluid-36/38: 岛签名+计算值家族永不缩放
+        if(fabs(arg1 - ISLAND_RESP) < ISLAND_EPS || fabs(arg1) < ISLAND_EPS){ //Fluid-36/40: 岛主签名+瞬时值(0)永不缩放；计算值改由 loop-breaker 按节奏断
             if (scaleWatchFirst(@"island-gate", arg1)){ //Fluid-38: 首见才记日志+采调用链
                 if (islandLogBudget > 0){ islandLogBudget--; diagLogB(@"[island-preset] setResponse %g passed stock (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self); }
                 sampleTraceCore(@"island-gate", @"setResponse", arg1, &scaleBtBudget);
@@ -674,6 +713,12 @@ static void startLockPolling(void){
             return;
         }
         if(isSpeedEnable){
+            if (loopBreakerActive(arg1)){ //Fluid-40: 值级 armed → 该值 stock（App 手速够不到阈值，循环节奏才触发）
+                if (lbLogBudget > 0){ lbLogBudget--; diagLogB(@"[loop-break] setResponse %g passed stock (armed) (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self); }
+                %orig;
+                return;
+            }
+            loopBreakerNote(arg1); //Fluid-40: 双窗计数（快窗6/0.3s + 慢窗12/1.2s），同值持续重复=循环
             if (scaleWatchFirst(@"R", arg1)){ //Fluid-38: 唯一值首见才记，爆发不再吃光预算
                 if (scaleWatchBudget > 0){ scaleWatchBudget--; diagLogB(@"[scale-watch] setResponse %g scaled first (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self); }
                 sampleTraceCore(@"scale-bt", @"setResponse", arg1, &scaleBtBudget);
@@ -1357,7 +1402,7 @@ static void folderRestoreBSAnimSettings(id settings){
 		diagLogPath = @"/var/mobile/Library/SpeedsterDiag.log";
 		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring
 		diagBudget = 500; //budget for the pre-first-transition (locked after respring) session
-		diagLog(@"Speedster 2.1.5-Fluid-5 loaded in SpringBoard, deviceLocked(assumed)=%d", deviceLocked);
+		diagLog(@"Speedster 2.1.5-Fluid-6 loaded in SpringBoard, deviceLocked(assumed)=%d", deviceLocked);
 		//boot self-check: one line snapshot of install + feature state
 		diagLog(@"[selfcheck] speed=%d slider=%lu fine=%d(%g) bounce=%d slider=%lu fine=%d(%g) | folder=%d speed=%g bounce=%d(%g) | inapp=%d speed=%g bounce=%d(%g)",
 		        isSpeedEnable, (unsigned long)Speedvalue, isFineTuneSpeedEnable, FineTuneSpeedValue,
