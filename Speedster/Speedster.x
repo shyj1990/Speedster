@@ -334,6 +334,53 @@ static BOOL lockPrepActive(void){
     return YES;
 }
 
+//Fluid-35 STORM-GUARD（灵动岛 AirPods 循环闪断路器）：
+//用户 A/B 实锤（2026-09-29）：开「应用打开/关闭速度」→ 蓝牙连接 AirPods 后灵动岛
+//耳机图标转动时 ~0.32s 闪一次（录屏逐帧分析：整岛内容双影叠印，图标+绿圈同时重影，
+//并有 "AirPods Pro" 文字布局残影）；关掉该开关注销 → 不闪。机制与 Fluid-13 锁胶囊
+//同族：缩放弹簧让岛的呈现动画提前完成，呈现状态机不断重新呈现，每次重新呈现新建
+//短命 SBFFluidBehaviorSettings（Fresh-3 实证全是短命对象），全部被 isSpeedEnable
+//缩放 → 循环自持。现有豁免（boot/unlock/lock-prep/volumeHUD/locked）都覆盖不了解锁态
+//的岛呈现。判别依据：应用开关动画是单次爆发（几十毫秒级突发），闪烁循环是持续
+//≥1s 的缩放级调用流 —— 滑动窗口区分两者：1.6s 窗口内 ≥16 次缩放级调用且窗口跨度
+//≥1.2s → 断路器跳闸 3.5s，期间全 stock 透传（stock 值呈现一次即稳定，Fluid-15/13
+//实证 stock 永不闪）。误报代价 = 几秒原版动画（与 lock-prep 同哲学，方向永远安全）。
+//armed 期间只透传不分析，3.5s 后若循环仍活着会重新武装（自愈）。
+#define STORM_WIN_SECS 1.6
+#define STORM_MIN_CALLS 16
+#define STORM_MIN_SPAN 1.2
+#define STORM_ARM_SECS 3.5
+static CFAbsoluteTime stormGuardUntil = 0;
+static CFAbsoluteTime stormTimes[32]; //插入序环形缓冲（fluid setter 均主线程，无锁）
+static NSInteger stormIdx = 0;
+static NSInteger stormFilled = 0;
+static NSInteger stormLogBudget = 40;
+
+static BOOL stormGuardActive(void){
+    if (!isOnSpringBoard || deviceLocked) return NO;
+    return CFAbsoluteTimeGetCurrent() < stormGuardUntil;
+}
+
+static void stormGuardNoteCall(void){
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (now < stormGuardUntil) return; //armed：只透传不分析，到期后凭新调用重新评估
+    stormTimes[stormIdx] = now;
+    stormIdx = (stormIdx + 1) % 32;
+    if (stormFilled < 32) stormFilled++;
+    CFAbsoluteTime oldest = now;
+    NSInteger inWin = 0;
+    for (NSInteger i = 0; i < stormFilled; i++){
+        CFAbsoluteTime t = stormTimes[i];
+        if ((now - t) <= STORM_WIN_SECS){ inWin++; if (t < oldest) oldest = t; }
+    }
+    if (inWin >= STORM_MIN_CALLS && (now - oldest) >= STORM_MIN_SPAN){
+        stormGuardUntil = now + STORM_ARM_SECS;
+        stormIdx = 0; stormFilled = 0; //跳闸后清空，凭 armed 后的新调用重新累计
+        diagLog(@"[storm-guard] ARMED: %ld scaled-calls span %.2fs — island loop breaker, stock for %.1fs",
+                (long)inWin, now - oldest, (double)STORM_ARM_SECS);
+    }
+}
+
 static void diagLogCore(NSString *fmt, va_list args){
     if (!diagLogPath) return;
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
@@ -542,7 +589,13 @@ static void startLockPolling(void){
             %orig;
             return;
         }
+        if(stormGuardActive()){ //Fluid-35: 灵动岛循环闪断路器，armed 期间全 stock
+            if (stormLogBudget > 0){ stormLogBudget--; diagLogB(@"[storm-guard] setResponse %g passed stock (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self); }
+            %orig;
+            return;
+        }
         if(isSpeedEnable){
+            stormGuardNoteCall(); //Fluid-35: 缩放级调用入环形缓冲（判岛循环）
             recordStockValue(stockResponseValues, self, arg1); //Fresh-4: record ONLY right before scaling - registry holds just the objects we actually touched
             if(!isFineTuneSpeedEnable){
                 //Change speed value base on selector pos
@@ -643,7 +696,13 @@ static void startLockPolling(void){
             %orig;
             return;
         }
+        if(stormGuardActive()){ //Fluid-35: 灵动岛循环闪断路器，armed 期间全 stock
+            if (stormLogBudget > 0){ stormLogBudget--; diagLogB(@"[storm-guard] setDampingRatio %g passed stock (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self); }
+            %orig;
+            return;
+        }
         if(isBounceEnable){
+            stormGuardNoteCall(); //Fluid-35: 缩放级调用入环形缓冲（判岛循环）
             recordStockValue(stockDampingRatioValues, self, arg1); //Fresh-4: record ONLY right before scaling
             if(!isFineTuneBounceEnable){
                 switch (Bouncevalue){
@@ -1206,7 +1265,7 @@ static void folderRestoreBSAnimSettings(id settings){
 		diagLogPath = @"/var/mobile/Library/SpeedsterDiag.log";
 		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring
 		diagBudget = 500; //budget for the pre-first-transition (locked after respring) session
-		diagLog(@"Speedster 2.1.5-Fluid loaded in SpringBoard, deviceLocked(assumed)=%d", deviceLocked);
+		diagLog(@"Speedster 2.1.5-Fluid-1 loaded in SpringBoard, deviceLocked(assumed)=%d", deviceLocked);
 		//boot self-check: one line snapshot of install + feature state
 		diagLog(@"[selfcheck] speed=%d slider=%lu fine=%d(%g) bounce=%d slider=%lu fine=%d(%g) | folder=%d speed=%g bounce=%d(%g) | inapp=%d speed=%g bounce=%d(%g)",
 		        isSpeedEnable, (unsigned long)Speedvalue, isFineTuneSpeedEnable, FineTuneSpeedValue,
