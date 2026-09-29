@@ -381,6 +381,33 @@ static void stormGuardNoteCall(void){
     }
 }
 
+//Fluid-36 ISLAND-PRESET GATE（岛预设签名门闸）：
+//Fluid-35 实测结论：storm-guard t+13s 跳闸后循环的 fluid 调用彻底静默（无 re-arm），
+//但用户仍见闪 → 冻结式循环：缩放值在岛第一次呈现的爆发（~16 个对象）中一次性写入
+//岛的私有副本，之后岛从冻结副本每 0.32s 反复重呈现，不再走 setter。事后 stock 透传
+//救不了已冻结副本（Fluid-15 T-1.3s 间隙同款病）。必须在毒药写入点拦截。
+//日志数值分布实证：response 0.531 / dampingRatio 0.845 是岛/锁胶囊/dock 家族签名
+//（locked 期 236+236 次全成对、boot 期 43+48 次成对、Fluid-35 跳闸爆发 16 对象同签名），
+//app 开关家族 response≈0.457 与之明显分离。对这两个精确值（±0.005）永不缩放；
+//任一签名出现后开 300ms 窗口，同爆发的伴生对象（如 0.336/1）也全 stock。
+//误伤面 = 恰好用这两个值的动画跑原版速度（数值特征极窄，方向永远安全）。
+//文件夹 dock 同签名但不受损：文件夹机制带 restoringForHUD 走独立显式缩放。
+#define ISLAND_RESP 0.531
+#define ISLAND_DAMP 0.845
+#define ISLAND_EPS 0.005
+#define ISLAND_BURST_SECS 0.30
+static CFAbsoluteTime islandBurstUntil = 0;
+static NSInteger islandLogBudget = 120;
+static NSInteger lockedLogBudget = 30;
+
+static BOOL islandBurstActive(void){
+    return CFAbsoluteTimeGetCurrent() < islandBurstUntil;
+}
+
+static void islandBurstNote(void){
+    islandBurstUntil = CFAbsoluteTimeGetCurrent() + ISLAND_BURST_SECS;
+}
+
 static void diagLogCore(NSString *fmt, va_list args){
     if (!diagLogPath) return;
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
@@ -585,7 +612,19 @@ static void startLockPolling(void){
             return;
         }
         if(deviceLocked){ //lock-screen island/UI (e.g. lock pill) animations run stock
-            diagLogB(@"setResponse %g while locked (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self);
+            if (lockedLogBudget > 0){ lockedLogBudget--; diagLogB(@"setResponse %g while locked (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self); }
+            %orig;
+            return;
+        }
+        if(fabs(arg1 - ISLAND_RESP) < ISLAND_EPS){ //Fluid-36: 岛预设签名 response 0.531 永不缩放
+            if (islandLogBudget > 0){ islandLogBudget--; diagLogB(@"[island-preset] setResponse %g passed stock (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self); }
+            islandBurstNote();
+            %orig;
+            return;
+        }
+        if(islandBurstActive()){ //Fluid-36: 岛呈现爆发窗口内的伴生对象全 stock
+            if (islandLogBudget > 0){ islandLogBudget--; diagLogB(@"[island-preset] burst: setResponse %g passed stock (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self); }
+            islandBurstNote(); //窗口内存活调用刷新窗口，爆发整体覆盖
             %orig;
             return;
         }
@@ -692,7 +731,19 @@ static void startLockPolling(void){
             return;
         }
         if(deviceLocked){ //lock-screen island/UI (e.g. lock pill) animations run stock
-            diagLogB(@"setDampingRatio %g while locked (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self);
+            if (lockedLogBudget > 0){ lockedLogBudget--; diagLogB(@"setDampingRatio %g while locked (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self); }
+            %orig;
+            return;
+        }
+        if(fabs(arg1 - ISLAND_DAMP) < ISLAND_EPS){ //Fluid-36: 岛预设签名 dampingRatio 0.845 永不缩放
+            if (islandLogBudget > 0){ islandLogBudget--; diagLogB(@"[island-preset] setDampingRatio %g passed stock (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self); }
+            islandBurstNote();
+            %orig;
+            return;
+        }
+        if(islandBurstActive()){ //Fluid-36: 岛呈现爆发窗口内的伴生对象全 stock
+            if (islandLogBudget > 0){ islandLogBudget--; diagLogB(@"[island-preset] burst: setDampingRatio %g passed stock (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self); }
+            islandBurstNote(); //窗口内存活调用刷新窗口，爆发整体覆盖
             %orig;
             return;
         }
@@ -1265,7 +1316,7 @@ static void folderRestoreBSAnimSettings(id settings){
 		diagLogPath = @"/var/mobile/Library/SpeedsterDiag.log";
 		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring
 		diagBudget = 500; //budget for the pre-first-transition (locked after respring) session
-		diagLog(@"Speedster 2.1.5-Fluid-1 loaded in SpringBoard, deviceLocked(assumed)=%d", deviceLocked);
+		diagLog(@"Speedster 2.1.5-Fluid-2 loaded in SpringBoard, deviceLocked(assumed)=%d", deviceLocked);
 		//boot self-check: one line snapshot of install + feature state
 		diagLog(@"[selfcheck] speed=%d slider=%lu fine=%d(%g) bounce=%d slider=%lu fine=%d(%g) | folder=%d speed=%g bounce=%d(%g) | inapp=%d speed=%g bounce=%d(%g)",
 		        isSpeedEnable, (unsigned long)Speedvalue, isFineTuneSpeedEnable, FineTuneSpeedValue,
