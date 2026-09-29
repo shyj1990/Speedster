@@ -451,7 +451,8 @@ static void loopBreakerNote(double v){
     [arr addObject:@(now)];
     NSMutableIndexSet *drop = [NSMutableIndexSet indexSet];
     for (NSUInteger i = 0; i < arr.count; i++){
-        if (now - arr[i].doubleValue > LB_SLOW_WIN) [drop addIndex:i];
+        NSNumber *t = arr[i]; //Fluid-40: 显式类型（id 上取 doubleValue 属性 CI 编译报错，Fluid-4 同坑）
+        if (now - t.doubleValue > LB_SLOW_WIN) [drop addIndex:i];
     }
     if (drop.count) [arr removeObjectsAtIndexes:drop];
     BOOL fast = NO, slow = NO;
