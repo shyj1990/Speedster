@@ -23,7 +23,16 @@ Function
 ========
 测试环境：iPhone 15 Pro / iOS 17.0 / relaxin（roothide 系）越狱。
 
-**v2.1.4-Fluid-5（当前版本）**
+**v2.1.5-Fluid（当前版本）**
+- 文件夹动画：新增文件夹开/关速度与回弹独立滑条（缩放写入时绕过开关动画钩子防双重缩放），实时调节生效
+- 灵动岛锁图标闪烁修复：按锁屏键后约 1.3 秒的熄屏准备窗口（lock-prep 门闸）与锁屏/解锁转换全程强制原版弹簧参数，解锁瞬间零写入
+- 参数登记表瘦身：只登记真正被缩放的对象，锁屏时不再批量重写数百个透传对象
+- 长寿常驻配置对象（灵动岛胶囊等）永远保持原版参数，只缩放转场新建的短命对象
+- 2.1.4-Fluid 全部功能保留：开关动画/回弹、应用内动画、音量 HUD 豁免、开机/解锁宽限期、百分比输入框、等比滑条刻度
+
+> 说明：v2.1.4-Fluid-5/6/7/8（锁图标闪烁诊断版）为过渡测试版，已从 Releases 移除，其内容已并入当前版本。
+
+**v2.1.4-Fluid-5**
 - 回弹、应用内、文件夹滑条与应用开关滑条统一刻度：0% = 原生表现，最快端封顶（回弹最弹端从 dampingRatio 0.1 收到 0.2；应用内/文件夹最快端 = 原生 ×0.1，弹簧约快 3.2 倍），取消 Fluid-3 的慢于原生区间
 
 **v2.1.4-Fluid-4**
@@ -59,6 +68,11 @@ Function
 Building
 ========
 You need to have [Theos](https://theos.dev/) installed and configured
+
+Build for roothide（本分支 CI 使用的方案）
+```
+make package THEOS_PACKAGE_SCHEME=roothide
+```
 
 Build for rootful
 ```
