@@ -412,14 +412,24 @@ static NSInteger islandLogBudget = 120;
 static NSInteger lockedLogBudget = 30;
 static NSInteger scaleWatchBudget = 200; //Fluid-38: 首见才扣，全程有效
 
+//Fluid-39（Fluid-4 日志裁决，App 速度恢复版）：Fluid-4 六值门闸止闪但杀 App 速度。
+//带回的 [island-gate]/[scale-bt] 调用链指纹揭示三链分野：
+//  岛呈现链（0.531/0.336/0）：共享特征帧 SpringBoard!0x5f4a3c/0x74d7a8/0x74c4c8；
+//  App 转场链（0.417267/0.465467/0.55）：SpringBoard!0x6bfxxx→0x1f2f2c→0x1c8xxx/0x1c9xxx，
+//    且 0.4655~0.4699 出现连续漂移变体（0.465799/0.466703/0.467378/0.469861）+ 0.47144
+//    差 0.0006 漏网被缩放 = 拖拽/转场手势连续插值族，是 App 开关动画主力弹簧；
+//  独立第三链（0.319081）：0x36xxxx/0x70xxxx/0x6ac300/0x447938。
+//复查 Fluid-3 时间线：岛循环本体 = 0.319081 族（同对象 3ms 重复 = 循环铁证）；而
+//0.417267/0.465467/0.55 簇（t+1.5/t+14）无循环特征，实为测试期间的用户 App 转场
+//（Fluid-3 中它们被缩放且 App 速度正常 = 佐证）。
+//→ 门闸收窄为三值 0.336/0/0.319081（岛呈现伴随+循环本体），放行 App 转场三族。
+//残留风险：App 期 0.319081（第三链）被拦，若 App 某子动画依赖它则局部恢复原速；
+//若岛仍闪 → 0.417267/0.465467/0.55 的岛期链样本会进下份日志，Fluid-6 按链指纹终裁。
 //Fluid-38: Fluid-3 实测岛计算值家族（响应侧）。全部与 app 家族 0.457 分离。
 static BOOL isIslandCalcResponse(double v){
     return fabs(v - 0.336)    < ISLAND_EPS
         || fabs(v)            < ISLAND_EPS   //0：岛爆发伴随值（stock 写 0 即其本意）
-        || fabs(v - 0.319081) < ISLAND_EPS
-        || fabs(v - 0.417267) < ISLAND_EPS
-        || fabs(v - 0.465467) < ISLAND_EPS
-        || fabs(v - 0.55)     < ISLAND_EPS;
+        || fabs(v - 0.319081) < ISLAND_EPS;
 }
 
 static void diagLogCore(NSString *fmt, va_list args){
@@ -1347,7 +1357,7 @@ static void folderRestoreBSAnimSettings(id settings){
 		diagLogPath = @"/var/mobile/Library/SpeedsterDiag.log";
 		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring
 		diagBudget = 500; //budget for the pre-first-transition (locked after respring) session
-		diagLog(@"Speedster 2.1.5-Fluid-4 loaded in SpringBoard, deviceLocked(assumed)=%d", deviceLocked);
+		diagLog(@"Speedster 2.1.5-Fluid-5 loaded in SpringBoard, deviceLocked(assumed)=%d", deviceLocked);
 		//boot self-check: one line snapshot of install + feature state
 		diagLog(@"[selfcheck] speed=%d slider=%lu fine=%d(%g) bounce=%d slider=%lu fine=%d(%g) | folder=%d speed=%g bounce=%d(%g) | inapp=%d speed=%g bounce=%d(%g)",
 		        isSpeedEnable, (unsigned long)Speedvalue, isFineTuneSpeedEnable, FineTuneSpeedValue,
