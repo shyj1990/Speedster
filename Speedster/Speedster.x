@@ -347,11 +347,12 @@ static BOOL lockPrepActive(void){
 //实证 stock 永不闪）。误报代价 = 几秒原版动画（与 lock-prep 同哲学，方向永远安全）。
 //armed 期间只透传不分析，3.5s 后若循环仍活着会重新武装（自愈）。
 #define STORM_WIN_SECS 1.6
-#define STORM_MIN_CALLS 48 //Fluid-41: 32→48 再降敏（App 陪葬主因=净化窗，兜底越少触发越好）
+#define STORM_MIN_CALLS 80 //Fluid-9: 48→80 数据校准。Fluid-8 全量日志实测：App 转场单波 ≤60 次/1.6s 窗（波间隔 4-5s，窗内只容一波）→ 80 留 20 余量不误伤；岛循环爆发 87 次/1.6s → 仍 >80 可触发。Fluid-41 的 48 低于 App 单波，storm 复活必误伤，故当时连缓冲都不敢扩（哑火保平安）
 #define STORM_MIN_SPAN 1.2
 #define STORM_ARM_SECS 1.5 //Fluid-41: 3.5→1.5 净化窗缩短（Fluid-6 实测：循环爆发 ARM 后 11ms 内即停，长窗纯伤 App）
+#define STORM_BUF_SIZE 128 //Fluid-9: 缓冲 32→128 修哑火。Fluid-41 把阈值提到 48 但缓冲仍 32 → stormFilled 封顶 32，inWin>=48 永假，保险自 Fluid-41 起从未生效（Fluid-8 日志：爆发 87 次/1.6s 零 ARM）。128 > 窗口内实测最大 87，足容
 static CFAbsoluteTime stormGuardUntil = 0;
-static CFAbsoluteTime stormTimes[32]; //插入序环形缓冲（fluid setter 均主线程，无锁）
+static CFAbsoluteTime stormTimes[STORM_BUF_SIZE]; //插入序环形缓冲（fluid setter 均主线程，无锁）
 static NSInteger stormIdx = 0;
 static NSInteger stormFilled = 0;
 static NSInteger stormLogBudget = 40;
@@ -365,8 +366,8 @@ static void stormGuardNoteCall(void){
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     if (now < stormGuardUntil) return; //armed：只透传不分析，到期后凭新调用重新评估
     stormTimes[stormIdx] = now;
-    stormIdx = (stormIdx + 1) % 32;
-    if (stormFilled < 32) stormFilled++;
+    stormIdx = (stormIdx + 1) % STORM_BUF_SIZE;
+    if (stormFilled < STORM_BUF_SIZE) stormFilled++;
     CFAbsoluteTime oldest = now;
     NSInteger inWin = 0;
     for (NSInteger i = 0; i < stormFilled; i++){
@@ -422,6 +423,13 @@ static void diagLog(NSString *fmt, ...); //前向声明（下方辅助块位于 
 //四值硬门闸 + storm 48/1.6s→1.5s 兜底 + 全量缩放日志（rCallBudget 250）。
 //（Fluid-40/41 历史备注：值级 loop-breaker 双窗快窗6次/0.3s+慢窗12次/1.2s→ARM——已被
 //Fluid-7 全量日志证伪删除，App 主弹簧 0.512 连发频率与循环同量级，判别死路。）
+
+//Fluid-9（storm 哑火修复，Fluid-8 收工复盘发现）：Fluid-41 把 STORM_MIN_CALLS 提到 48
+//却没扩 stormTimes[32] 缓冲 → stormFilled 封顶 32，inWin>=48 永假，兜底自 Fluid-41 起
+//从未生效（Fluid-8 日志实证：爆发 87 次/1.6s 零 ARM）。Fluid-8 时按"实测完美就别动"
+//暂不修（怕复活误伤 App）；Fluid-9 借全量日志数据校准复活：阈值 48→80（App 单波 ≤60
+//留 20 余量 / 岛爆发 87 仍可触发）、缓冲 32→128（>87 足容）。storm ARM = 全 stock 透传
+//1.5s，误报代价仅几秒原版动画（方向永远安全），与 lock-prep 同哲学。
 
 //Fluid-41（Fluid-6 日志终审）：①岛循环每轮新建对象（0.319081 爆发=11ms 内 15 个不同 self，
 //对象级判别死路实锤）；②循环会改道（0.319081 ARM 后 11ms 内即停→改道 0.149985/0.417267
@@ -1359,7 +1367,7 @@ static void folderRestoreBSAnimSettings(id settings){
 		diagLogPath = @"/var/mobile/Library/SpeedsterDiag.log";
 		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring
 		diagBudget = 500; //budget for the pre-first-transition (locked after respring) session
-		diagLog(@"Speedster 2.1.5-Fluid-8 loaded in SpringBoard, deviceLocked(assumed)=%d", deviceLocked);
+		diagLog(@"Speedster 2.1.5-Fluid-9 loaded in SpringBoard, deviceLocked(assumed)=%d", deviceLocked);
 		//boot self-check: one line snapshot of install + feature state
 		diagLog(@"[selfcheck] speed=%d slider=%lu fine=%d(%g) bounce=%d slider=%lu fine=%d(%g) | folder=%d speed=%g bounce=%d(%g) | inapp=%d speed=%g bounce=%d(%g)",
 		        isSpeedEnable, (unsigned long)Speedvalue, isFineTuneSpeedEnable, FineTuneSpeedValue,
