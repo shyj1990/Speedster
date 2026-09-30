@@ -412,65 +412,16 @@ static NSInteger islandLogBudget = 120;
 static NSInteger lockedLogBudget = 30;
 static NSInteger scaleWatchBudget = 200; //Fluid-38: 首见才扣，全程有效
 
-static void diagLog(NSString *fmt, ...); //Fluid-40: 前向声明（loop-breaker 块位于 diagLog 定义之前）
-//Fluid-40（Fluid-5 日志终裁）：三链指纹证伪——链2(0x36xxxx) 同时承载岛循环的
-//0.319081 与 App 期 0.300348/0.301082；链3(0x6bfxxx) 同时承载岛循环启动的 0.417267/
-//0.465467/0.55（7690.17 循环启动触发 ARM）与 App 期 0.397667/0.153143/0.1554。
-//调用方代码层面岛循环与 App 转场不分家 → 链指纹死路。Fluid-5 的"岛不闪"实为 storm-guard
-//压制（back-to-back ARMED 4 次，7714-7728 循环持续 16-32 calls/1.3s），App 转场主体弹簧
-//（0.336/0.319081 被 island-gate 拦 + 0.465 族被 storm 拦）全 stock → App 慢。
-//Fluid-3 岛闪+App 快同代的唯一调和 = 循环与转场同值不同节奏：循环 = 同值持续重复
-//（爆发 24 次/48ms 或持续 16-32 次/1.3s），App 转场 = 同值 1-2 次/次、人手节拍
-//（Fluid-5 日志实证单次 App 开关 = 1-4 次缩放级调用）。
-//→ Fluid-6 拆全部值门闸（0 除外：response 0 = 瞬时语义，缩放它=把瞬时变 0.19，纯错误），
-//新增值级 LOOP-BREAKER 双窗：快窗 6 次/0.3s（抓爆发循环）+ 慢窗 12 次/1.2s（抓持续循环），
-//任一触发 → 该值 ARM 8s 全对象 stock（ARM 期清窗重累计；App 手速永远够不到阈值）。
-//storm-guard 全局阈值 16→32 降敏为最后兜底。
-static NSMutableDictionary *lbTimes;   // key=值4dp -> NSMutableArray(CFAbsoluteTime)
-static NSMutableDictionary *lbArmed;   // key=值4dp -> NSNumber(until)
-static NSInteger lbLogBudget = 40;
-#define LB_FAST_WIN 0.3
-#define LB_FAST_N 6
-#define LB_SLOW_WIN 1.2
-#define LB_SLOW_N 12
-#define LB_ARM_SECS 3.0 //Fluid-41: 8.0→3.0（循环爆发被接住后 11ms 内即改道，8s 净化窗纯伤 App 期共享值）
-static NSString *lbKey(double v){ return [NSString stringWithFormat:@"%.4f", v]; }
-static BOOL loopBreakerActive(double v){
-    if (!isOnSpringBoard) return NO;
-    NSNumber *until = lbArmed[lbKey(v)];
-    return until && until.doubleValue > CFAbsoluteTimeGetCurrent();
-}
-static void loopBreakerNote(double v){
-    if (!isOnSpringBoard) return;
-    if (!lbTimes) lbTimes = [NSMutableDictionary new];
-    if (lbTimes.count > 64){ [lbTimes removeAllObjects]; } //防御
-    NSString *k = lbKey(v);
-    NSMutableArray *arr = lbTimes[k];
-    if (!arr){ arr = [NSMutableArray array]; lbTimes[k] = arr; }
-    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    [arr addObject:@(now)];
-    NSMutableIndexSet *drop = [NSMutableIndexSet indexSet];
-    for (NSUInteger i = 0; i < arr.count; i++){
-        NSNumber *t = arr[i]; //Fluid-40: 显式类型（id 上取 doubleValue 属性 CI 编译报错，Fluid-4 同坑）
-        if (now - t.doubleValue > LB_SLOW_WIN) [drop addIndex:i];
-    }
-    if (drop.count) [arr removeObjectsAtIndexes:drop];
-    BOOL fast = NO, slow = NO;
-    if (arr.count >= LB_SLOW_N){ //窗外项刚清掉，剩余全在慢窗内
-        slow = YES;
-        NSInteger fastCnt = 0;
-        for (NSNumber *t in arr) if (now - t.doubleValue <= LB_FAST_WIN) fastCnt++;
-        fast = fastCnt >= LB_FAST_N;
-    }
-    if (fast || slow){
-        lbArmed = lbArmed ?: [NSMutableDictionary new];
-        lbArmed[k] = @(now + LB_ARM_SECS);
-        [arr removeAllObjects]; //ARM 后清窗，到期凭新调用重新累计
-        if (lbLogBudget > 0){ lbLogBudget--;
-            diagLog(@"[loop-break] ARMED value=%g (%s) — value stock for %.0fs", v, fast?"fast":"slow", (double)LB_ARM_SECS);
-        }
-    }
-}
+static void diagLog(NSString *fmt, ...); //前向声明（下方辅助块位于 diagLog 定义之前）
+//Fluid-42（Fluid-7 日志终审）：四值硬门闸 {0.531,0,0.319081,0.336} 单独就把岛循环摁死
+//（全-session 0 次 storm ARM、循环值在缩放序列零出现 = 循环核心被门闸断粮，根本起不来）。
+//而 loop-breaker 实测只干坏事：App 开关时 0.512 每秒连续 5-7 次调用（全量日志实拍：
+//t+49.3-50.8 十几连发）→ 快窗 6次/0.3s 被 App 自己的节奏撞线 → 误 ARM 0.512/0.301082
+//各 3s → ARM 期 App 转场调用被拦 19 次 = App 慢真凶。**节奏判别对 App 主弹簧死路**
+//（App 连续开关的调用频率与循环同量级）→ Fluid-8 彻底删除 loop-breaker，仅保留
+//四值硬门闸 + storm 48/1.6s→1.5s 兜底 + 全量缩放日志（rCallBudget 250）。
+//（Fluid-40/41 历史备注：值级 loop-breaker 双窗快窗6次/0.3s+慢窗12次/1.2s→ARM——已被
+//Fluid-7 全量日志证伪删除，App 主弹簧 0.512 连发频率与循环同量级，判别死路。）
 
 //Fluid-41（Fluid-6 日志终审）：①岛循环每轮新建对象（0.319081 爆发=11ms 内 15 个不同 self，
 //对象级判别死路实锤）；②循环会改道（0.319081 ARM 后 11ms 内即停→改道 0.149985/0.417267
@@ -728,12 +679,6 @@ static void startLockPolling(void){
             return;
         }
         if(isSpeedEnable){
-            if (loopBreakerActive(arg1)){ //Fluid-40: 值级 armed → 该值 stock（App 手速够不到阈值，循环节奏才触发）
-                if (lbLogBudget > 0){ lbLogBudget--; diagLogB(@"[loop-break] setResponse %g passed stock (armed) (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self); }
-                %orig;
-                return;
-            }
-            loopBreakerNote(arg1); //Fluid-40: 双窗计数（快窗6/0.3s + 慢窗12/1.2s），同值持续重复=循环
             if (rCallBudget > 0){ rCallBudget--; diagLogB(@"[scale-watch] setResponse %g scaled (%@ self=%p)", arg1, NSStringFromClass([(id)self class]), self); } //Fluid-41: 全量缩放日志（首见去重退役，App 转场值序列必需）
             stormGuardNoteCall(); //Fluid-35: 缩放级调用入环形缓冲（判岛循环）
             recordStockValue(stockResponseValues, self, arg1); //Fresh-4: record ONLY right before scaling - registry holds just the objects we actually touched
@@ -1414,7 +1359,7 @@ static void folderRestoreBSAnimSettings(id settings){
 		diagLogPath = @"/var/mobile/Library/SpeedsterDiag.log";
 		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring
 		diagBudget = 500; //budget for the pre-first-transition (locked after respring) session
-		diagLog(@"Speedster 2.1.5-Fluid-7 loaded in SpringBoard, deviceLocked(assumed)=%d", deviceLocked);
+		diagLog(@"Speedster 2.1.5-Fluid-8 loaded in SpringBoard, deviceLocked(assumed)=%d", deviceLocked);
 		//boot self-check: one line snapshot of install + feature state
 		diagLog(@"[selfcheck] speed=%d slider=%lu fine=%d(%g) bounce=%d slider=%lu fine=%d(%g) | folder=%d speed=%g bounce=%d(%g) | inapp=%d speed=%g bounce=%d(%g)",
 		        isSpeedEnable, (unsigned long)Speedvalue, isFineTuneSpeedEnable, FineTuneSpeedValue,
