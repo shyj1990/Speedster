@@ -19,10 +19,13 @@ jobs:
       - name: Install Theos (roothide)
         run: |
           git clone --recursive https://github.com/roothide/theos.git $HOME/theos
-          #2026-10-07: 上游 10-06 提交（clang modules check / rootless.h）引入 logos 预处理回归，
-          #绿构建（09-30，commit dd5c14bb9 时代）源码未动却在 setResponse 报"函数体未闭合"。
-          #钉回最后已知良好 commit，待上游修复后再评估解钉。
-          git -C $HOME/theos checkout dd5c14bb9
+          #2026-10-07: 上游 10-06 批量提交引入 logos 预处理回归（源码未动，Speedster.x 报
+          #"function definition is not allowed here"）。上游提交顺序：e3b786f7e 加 roothide
+          #scheme → 294056dcc/f7646b576 加 clang modules check（回归起点）→ 0aee6f270 rootless.h
+          #→ 两个 submodule sync。钉 e3b786f7e = scheme 在、modules check 未进。
+          #（dd5c14bb9 是 09-18 上游同步，无 roothide scheme，钉它会报 "'roothide' package
+          #scheme does not exist"——首钉时踩过。）
+          git -C $HOME/theos checkout e3b786f7e
           git -C $HOME/theos submodule update --init --recursive
           brew install ldid xz
 
