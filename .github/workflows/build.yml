@@ -19,6 +19,11 @@ jobs:
       - name: Install Theos (roothide)
         run: |
           git clone --recursive https://github.com/roothide/theos.git $HOME/theos
+          #2026-10-07: 上游 10-06 提交（clang modules check / rootless.h）引入 logos 预处理回归，
+          #绿构建（09-30，commit dd5c14bb9 时代）源码未动却在 setResponse 报"函数体未闭合"。
+          #钉回最后已知良好 commit，待上游修复后再评估解钉。
+          git -C $HOME/theos checkout dd5c14bb9
+          git -C $HOME/theos submodule update --init --recursive
           brew install ldid xz
 
       - name: Install iOS 13.7 SDK
