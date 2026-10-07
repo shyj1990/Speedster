@@ -446,16 +446,34 @@ static BOOL isIslandCalcResponse(double v){ //Fluid-41: 岛循环核心计算值
         || fabs(v - 0.319081) < ISLAND_EPS;
 }
 
+//v2.1.6-Fluid-1: 常开 FILE* 取代逐行 open/close。旧成本 = 每行日志 fopen+fseek+ftell
+//+fwrite+fclose（5+ 次系统调用，App 测试一波 60 行 = 60 次开关文件）；新成本 = fputs
+//+fflush（1 次写盘）。每行 fflush 保证实时落盘（用户随时可导出，崩溃/注销零丢失）。
+//文件大小自记账，512KB 轮转不再需要逐行 ftell。不加锁：调用方均主队列（fluid setter
+//主线程 + 轮询 timer 主队列），Darwin stdio 对 FILE* 单次调用内部自串行（铁律 #4）。
+static FILE *diagFile = NULL;
+static long diagFileBytes = 0;
+
 static void diagLogCore(NSString *fmt, va_list args){
     if (!diagLogPath) return;
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
     NSString *line = [NSString stringWithFormat:@"[%.3f] %@\n",
                       [NSDate date].timeIntervalSince1970, msg];
-    FILE *f = fopen(diagLogPath.fileSystemRepresentation, "a");
-    if (f) {
-        fseek(f, 0, SEEK_END);
-        if (ftell(f) > 512 * 1024) { fclose(f); f = fopen(diagLogPath.fileSystemRepresentation, "w"); }
-        if (f) { fputs(line.UTF8String, f); fclose(f); }
+    if (!diagFile){ //lazy open：%ctor remove() 后首写即建新文件（与旧行为一致）
+        diagFile = fopen(diagLogPath.fileSystemRepresentation, "a");
+        if (diagFile){ fseek(diagFile, 0, SEEK_END); diagFileBytes = ftell(diagFile); }
+    }
+    if (!diagFile) return;
+    if (diagFileBytes > 512 * 1024){ //rotate（沿用旧 512KB 上限）
+        fclose(diagFile);
+        diagFile = fopen(diagLogPath.fileSystemRepresentation, "w");
+        diagFileBytes = 0;
+        if (!diagFile) return;
+    }
+    const char *utf8 = line.UTF8String;
+    if (fputs(utf8, diagFile) >= 0){
+        diagFileBytes += (long)strlen(utf8);
+        fflush(diagFile); //实时可见性：任何时刻导出日志都是完整的
     }
 }
 
@@ -591,15 +609,11 @@ static void startLockPolling(void){
     dispatch_source_set_timer(lockPollTimer,
                               dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
                               (int64_t)(0.5 * NSEC_PER_SEC), 0);
-    __block NSInteger heartbeatTicks = 0;
     dispatch_source_set_event_handler(lockPollTimer, ^{
         setDeviceLocked(queryUILocked(), "poll");
-        //Fluid-8: positive-evidence heartbeat. If the flash loop keeps running while this
-        //reports budget left, the loop provably makes NO hooked setter calls at all ->
-        //frozen-copy/controller-cache disease, not a settings-object disease.
-        if (deviceLocked && (++heartbeatTicks % 20) == 0) {
-            diagLog(@"heartbeat: locked, diagBudget left=%ld", (long)diagBudget);
-        }
+        //v2.1.6-Fluid-1: Fluid-8 的「正证据心跳」日志退役——它的使命（岛闪排查期证明
+        //锁屏期静默）已完成，岛闪已修复并双✓实测。稳态轮询现在只做一次 objc_msgSend，
+        //锁屏期零磁盘唤醒。若岛闪回归需要诊断，心跳代码在 git 历史（Fluid-8/9）。
     });
     dispatch_resume(lockPollTimer);
 }
@@ -1367,7 +1381,7 @@ static void folderRestoreBSAnimSettings(id settings){
 		diagLogPath = @"/var/mobile/Library/SpeedsterDiag.log";
 		remove(diagLogPath.fileSystemRepresentation); //fresh log per respring
 		diagBudget = 500; //budget for the pre-first-transition (locked after respring) session
-		diagLog(@"Speedster 2.1.6-Fluid loaded in SpringBoard, deviceLocked(assumed)=%d", deviceLocked);
+		diagLog(@"Speedster 2.1.6-Fluid-1 loaded in SpringBoard, deviceLocked(assumed)=%d", deviceLocked);
 		//boot self-check: one line snapshot of install + feature state
 		diagLog(@"[selfcheck] speed=%d slider=%lu fine=%d(%g) bounce=%d slider=%lu fine=%d(%g) | folder=%d speed=%g bounce=%d(%g) | inapp=%d speed=%g bounce=%d(%g)",
 		        isSpeedEnable, (unsigned long)Speedvalue, isFineTuneSpeedEnable, FineTuneSpeedValue,
