@@ -19,14 +19,16 @@ jobs:
       - name: Install Theos (roothide)
         run: |
           git clone --recursive https://github.com/roothide/theos.git $HOME/theos
-          #2026-10-07: 上游 10-06 批量提交引入 logos 预处理回归（源码未动，Speedster.x 报
-          #"function definition is not allowed here"）。上游提交顺序：e3b786f7e 加 roothide
-          #scheme → 294056dcc/f7646b576 加 clang modules check（回归起点）→ 0aee6f270 rootless.h
-          #→ 两个 submodule sync。钉 e3b786f7e = scheme 在、modules check 未进。
-          #（dd5c14bb9 是 09-18 上游同步，无 roothide scheme，钉它会报 "'roothide' package
-          #scheme does not exist"——首钉时踩过。）
+          #2026-10-07: 钉版修复 logos 预处理回归（本地复现实锤，源码零改动）。
+          #①theos 钉 e3b786f7e：roothide scheme 起点（vendor/mod/roothide/）；再老（dd5c14bb9）
+          #  会报 "'roothide' package scheme does not exist"。
+          #②真凶 = vendor/logos 777925d1 "[logos] Support multi-line block arguments in %orig
+          #  calls"——对 Speedster.x（含 9-30 绿构建源码）都生成 4 个未闭合 setter 函数体
+          #  （setResponse/setDampingRatio/setDamping/setMass），clang 报 "function definition
+          #  is not allowed here"。前一版 a623700 生成完全配平（本地扫描 final depth=0）。
           git -C $HOME/theos checkout e3b786f7e
           git -C $HOME/theos submodule update --init --recursive
+          git -C $HOME/theos/vendor/logos checkout a623700
           brew install ldid xz
 
       - name: Install iOS 13.7 SDK
